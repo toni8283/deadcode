@@ -121,6 +121,103 @@ _FRAMEWORK_PATTERNS: frozenset[str] = frozenset(
     }
 )
 
+# Base class names that indicate ast visitor-pattern dispatch (visit_*
+# methods are invoked via ``getattr`` inside the stdlib, not explicitly).
+_VISITOR_BASE_NAMES: frozenset[str] = frozenset({
+    "NodeVisitor", "ast.NodeVisitor",
+    "NodeTransformer", "ast.NodeTransformer",
+})
+
+# Base class names that indicate unittest discovery.
+_UNITTEST_BASE_NAMES: frozenset[str] = frozenset({
+    "TestCase", "unittest.TestCase",
+})
+
+# unittest lifecycle methods called implicitly by the test runner.
+_UNITTEST_LIFECYCLE_METHODS: frozenset[str] = frozenset({
+    "setUp", "tearDown",
+    "setUpClass", "tearDownClass",
+})
+
+
+# ---------------------------------------------------------------------------
+# Helpers for framework-aware classification
+# ---------------------------------------------------------------------------
+
+
+def _get_parent_class(
+    defn: SymbolDef,
+    definitions: dict[str, SymbolDef],
+) -> SymbolDef | None:
+    """Look up the enclosing class for a method, or ``None``."""
+    if "." not in defn.qualified_name:
+        return None
+    parent_qname = defn.qualified_name.rsplit(".", 1)[0]
+    parent = definitions.get(parent_qname)
+    if parent is not None and parent.kind == SymbolKind.CLASS:
+        return parent
+    return None
+
+
+def _extract_entrypoint_targets(repo_root: str) -> set[str]:
+    """
+    Extract qualified names referenced as entry points in ``pyproject.toml``.
+
+    Handles ``[project.scripts]``, ``[project.gui-scripts]``, and
+    ``[project.entry-points.*]`` sections per PEP 621.
+
+    Returns an empty set if ``pyproject.toml`` is not found, unreadable, or
+    contains no entry points.  Never raises.
+    """
+    targets: set[str] = set()
+    pyproject = Path(repo_root) / "pyproject.toml"
+    if not pyproject.exists():
+        return targets
+    try:
+        import tomllib
+
+        with open(pyproject, "rb") as f:
+            data = tomllib.load(f)
+    except Exception:  # noqa: BLE001
+        return targets
+
+    project = data.get("project", {})
+    if not isinstance(project, dict):
+        return targets
+
+    # [project.scripts] and [project.gui-scripts]
+    for section in ("scripts", "gui-scripts"):
+        entries = project.get(section, {})
+        if isinstance(entries, dict):
+            for _name, target in entries.items():
+                qname = _parse_entrypoint_ref(target)
+                if qname:
+                    targets.add(qname)
+
+    # [project.entry-points.<group>]
+    entry_points = project.get("entry-points", {})
+    if isinstance(entry_points, dict):
+        for _group, entries in entry_points.items():
+            if isinstance(entries, dict):
+                for _name, target in entries.items():
+                    qname = _parse_entrypoint_ref(target)
+                    if qname:
+                        targets.add(qname)
+
+    return targets
+
+
+def _parse_entrypoint_ref(target: str) -> str | None:
+    """Parse ``'module.path:attribute'`` → ``'module.path.attribute'``."""
+    if not isinstance(target, str) or ":" not in target:
+        return None
+    module, _, attr = target.partition(":")
+    module = module.strip()
+    attr = attr.strip()
+    if not module or not attr:
+        return None
+    return f"{module}.{attr}"
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -181,6 +278,9 @@ def _classify_all(index: RepoIndex, graph: ReferenceGraph) -> list[Candidate]:
     # Build a map: file_path → FileIndex for quick lookup
     file_map: dict[str, FileIndex] = {f.path: f for f in index.files}
 
+    # Pre-compute framework context
+    entrypoint_qnames = _extract_entrypoint_targets(index.root)
+
     candidates: list[Candidate] = []
 
     for qname, node in graph.nodes.items():
@@ -192,7 +292,9 @@ def _classify_all(index: RepoIndex, graph: ReferenceGraph) -> list[Candidate]:
             continue
 
         classification, evidence, uncertainty_reasons = _classify_node(
-            node, defn, file_index, error_files
+            node, defn, file_index, error_files,
+            definitions=index.definitions,
+            entrypoint_qnames=entrypoint_qnames,
         )
 
         # ---- Structured evidence fields ----
@@ -265,6 +367,9 @@ def _classify_node(
     defn: SymbolDef,
     file_index: FileIndex | None,
     error_files: set[str],
+    *,
+    definitions: dict[str, SymbolDef] | None = None,
+    entrypoint_qnames: set[str] | None = None,
 ) -> tuple[SafetyClassification, list[EvidenceItem], list[str]]:
     """
     Apply the fail-closed classification rules to one node.
@@ -371,6 +476,70 @@ def _classify_node(
                     "Multiple modules define a symbol with this name and no "
                     "unambiguous import record could pin the reference"
                 ),
+            )
+        )
+
+    # 10. Pytest test discovery (test_* functions/methods or Test* classes in test files)
+    if _is_test_file(defn.location.file):
+        if defn.kind in (SymbolKind.FUNCTION, SymbolKind.ASYNC_FUNCTION) and defn.name.startswith("test_"):
+            review_reasons.append(
+                EvidenceItem(
+                    reason="test_discovery",
+                    detail=f"'{defn.name}' is a test function/method discovered implicitly by pytest",
+                )
+            )
+        elif defn.kind == SymbolKind.CLASS and defn.name.startswith("Test"):
+            review_reasons.append(
+                EvidenceItem(
+                    reason="test_discovery",
+                    detail=f"'{defn.name}' is a test class discovered implicitly by pytest",
+                )
+            )
+
+    # 11. Conftest discovery: definitions in conftest.py
+    if Path(defn.location.file).name == "conftest.py":
+        review_reasons.append(
+            EvidenceItem(
+                reason="conftest_discovery",
+                detail=f"'{defn.name}' is defined in conftest.py and may be implicitly discovered by pytest",
+            )
+        )
+
+    # 12. AST visitor dispatch: visit_* methods on NodeVisitor / NodeTransformer subclasses
+    if defn.name.startswith("visit_"):
+        parent_class = _get_parent_class(defn, definitions) if definitions else None
+        if parent_class is not None and any(base in _VISITOR_BASE_NAMES for base in parent_class.base_classes):
+            review_reasons.append(
+                EvidenceItem(
+                    reason="visitor_dispatch",
+                    detail=f"'{defn.name}' is an AST visitor dispatch method on a NodeVisitor/NodeTransformer subclass",
+                )
+            )
+
+    # 13. Unittest discovery: TestCase subclasses and their test_* / lifecycle methods
+    parent_class = _get_parent_class(defn, definitions) if definitions else None
+    if parent_class is not None and any(base in _UNITTEST_BASE_NAMES for base in parent_class.base_classes):
+        if defn.name.startswith("test_") or defn.name in _UNITTEST_LIFECYCLE_METHODS:
+            review_reasons.append(
+                EvidenceItem(
+                    reason="unittest_discovery",
+                    detail=f"'{defn.name}' is a unittest test or lifecycle method on a TestCase subclass",
+                )
+            )
+    if defn.kind == SymbolKind.CLASS and any(base in _UNITTEST_BASE_NAMES for base in defn.base_classes):
+        review_reasons.append(
+            EvidenceItem(
+                reason="unittest_discovery",
+                detail=f"'{defn.name}' inherits from TestCase and is discovered implicitly by unittest",
+            )
+        )
+
+    # 14. Configuration entrypoints: targets referenced in pyproject.toml
+    if entrypoint_qnames and defn.qualified_name in entrypoint_qnames:
+        review_reasons.append(
+            EvidenceItem(
+                reason="config_entrypoint",
+                detail=f"'{defn.qualified_name}' is referenced as an entry point in pyproject.toml",
             )
         )
 

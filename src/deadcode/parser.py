@@ -207,6 +207,14 @@ class _FileVisitor(ast.NodeVisitor):
         name = node.name
         has_decorator = bool(node.decorator_list)
 
+        # Extract base class names for framework dispatch detection
+        base_names: list[str] = []
+        for base in node.bases:
+            try:
+                base_names.append(ast.unparse(base))
+            except Exception:  # noqa: BLE001
+                base_names.append("<unknown>")
+
         defn = SymbolDef(
             name=name,
             qualified_name=self._nested_qual(name),
@@ -214,6 +222,7 @@ class _FileVisitor(ast.NodeVisitor):
             location=self._loc(node),
             is_private=name.startswith("_"),
             has_decorator=has_decorator,
+            base_classes=base_names,
         )
         self.definitions.append(defn)
 

@@ -105,6 +105,7 @@ class SymbolDef:
     in_all: bool | None = None  # None = module has no __all__
     has_decorator: bool = False
     is_dunder: bool = False
+    base_classes: list[str] = field(default_factory=list)
 
     # True when the function/class body contains a dynamic call (getattr,
     # eval, globals, importlib, etc.).
