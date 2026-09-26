@@ -5,11 +5,17 @@ build-backend = "setuptools.backends.legacy:build"
 [project]
 name = "deadcode"
 version = "0.1.0"
-description = "Deterministic static-analysis engine for finding unused Python code"
+description = "Find and safely remove unused Python code — with proof."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-dependencies = []
+dependencies = [
+    "typer>=0.12",
+    "rich>=13",
+]
+
+[project.scripts]
+deadcode = "deadcode.cli:app"
 
 [project.optional-dependencies]
 dev = [
