@@ -176,12 +176,25 @@ def scan(
             console.print(f"[{STYLE_PROVABLE}]PROVABLE[/]  (none)\n")
 
     # ---- REVIEW ----
-    if filter_class in (None, SafetyClassification.REVIEW):
+    if filter_class == SafetyClassification.REVIEW:
         review = groups[SafetyClassification.REVIEW]
         if review:
             console.print(f"[{STYLE_REVIEW}]REVIEW[/]    ({len(review)} candidates)\n")
             for dc_id, cand in review:
                 _print_review_card(dc_id, cand, repo_root)
+        else:
+            console.print(f"[{STYLE_REVIEW}]REVIEW[/]    (none)\n")
+    elif filter_class is None:
+        review = groups[SafetyClassification.REVIEW]
+        if review:
+            console.print(
+                f"[{STYLE_REVIEW}]REVIEW[/]    "
+                f"({len(review)} candidates require manual review)\n"
+            )
+            console.print(
+                "  Run [bold]deadcode scan --only REVIEW[/] "
+                "to inspect all review candidates.\n"
+            )
         else:
             console.print(f"[{STYLE_REVIEW}]REVIEW[/]    (none)\n")
 
