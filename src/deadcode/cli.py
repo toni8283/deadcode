@@ -126,8 +126,7 @@ def scan(
 
     console.print()
     console.rule("[bold]DeadCode[/]")
-    console.print(f"  Repository : [cyan]{repo_root}[/]")
-    console.print()
+    console.print(f"  Repository      : [cyan]{repo_root}[/]")
 
     with console.status("Scanning…", spinner="dots"):
         result = analyze_repo(repo_root)
@@ -140,12 +139,8 @@ def scan(
         total_definitions=result.total_definitions,
     )
 
-    # Summary line
-    console.print(
-        f"  Files scanned      : [bold]{result.files_scanned}[/]\n"
-        f"  Symbols indexed    : [bold]{result.total_definitions}[/]\n"
-        f"  Candidates found   : [bold]{len(result.candidates)}[/]"
-    )
+    console.print(f"  Files scanned   : [bold]{result.files_scanned}[/]")
+    console.print(f"  Symbols indexed : [bold]{result.total_definitions}[/]")
     console.print()
 
     # Group by classification
@@ -157,6 +152,15 @@ def scan(
     for dc_id, cand in id_map.items():
         groups[cand.classification].append((dc_id, cand))
 
+    provable = groups[SafetyClassification.PROVABLE]
+    review = groups[SafetyClassification.REVIEW]
+    active = groups[SafetyClassification.ACTIVE]
+
+    console.print(f"  [{STYLE_PROVABLE}]PROVABLE[/]  {len(provable):>6}")
+    console.print(f"  [{STYLE_REVIEW}]REVIEW[/]    {len(review):>6}")
+    console.print(f"  [{STYLE_ACTIVE}]ACTIVE[/]    {len(active):>6}")
+    console.print()
+
     filter_class: SafetyClassification | None = None
     if only:
         try:
@@ -167,51 +171,59 @@ def scan(
 
     # ---- PROVABLE ----
     if filter_class in (None, SafetyClassification.PROVABLE):
-        provable = groups[SafetyClassification.PROVABLE]
+        console.rule()
+        console.print()
+        console.print(f"[{STYLE_PROVABLE}]PROVABLE CANDIDATES[/]\n")
         if provable:
-            console.print(f"[{STYLE_PROVABLE}]PROVABLE[/]  ({len(provable)} candidates)\n")
             for dc_id, cand in provable:
                 _print_provable_card(dc_id, cand, repo_root)
+            console.print(
+                f"  [bold]{len(provable)} candidate{'s' if len(provable) != 1 else ''} can be proven safe to remove.[/]\n"
+            )
         else:
-            console.print(f"[{STYLE_PROVABLE}]PROVABLE[/]  (none)\n")
+            console.print("  [dim]0 candidates can be proven safe to remove.[/]\n")
 
     # ---- REVIEW ----
     if filter_class == SafetyClassification.REVIEW:
-        review = groups[SafetyClassification.REVIEW]
+        console.rule()
+        console.print()
+        console.print(f"[{STYLE_REVIEW}]REVIEW CANDIDATES[/]  ({len(review)} candidates)\n")
         if review:
-            console.print(f"[{STYLE_REVIEW}]REVIEW[/]    ({len(review)} candidates)\n")
             for dc_id, cand in review:
                 _print_review_card(dc_id, cand, repo_root)
         else:
-            console.print(f"[{STYLE_REVIEW}]REVIEW[/]    (none)\n")
+            console.print("  [dim](none)[/]\n")
     elif filter_class is None:
-        review = groups[SafetyClassification.REVIEW]
+        console.rule()
+        console.print()
+        console.print(f"[{STYLE_REVIEW}]REVIEW[/]\n")
         if review:
             console.print(
-                f"[{STYLE_REVIEW}]REVIEW[/]    "
-                f"({len(review)} candidates require manual review)\n"
-            )
-            console.print(
-                "  Run [bold]deadcode scan --only REVIEW[/] "
-                "to inspect all review candidates.\n"
+                f"  {len(review)} candidate{'s' if len(review) != 1 else ''} require manual review.\n"
             )
         else:
-            console.print(f"[{STYLE_REVIEW}]REVIEW[/]    (none)\n")
+            console.print("  0 candidates require manual review.\n")
+        console.print("  For detailed review candidates:")
+        console.print("    [bold]deadcode scan --only REVIEW[/]\n")
+
+        console.print("  For evidence:")
+        console.print("    [bold]deadcode show DC-NNN[/]\n")
+        console.print("  For proof:")
+        console.print("    [bold]deadcode prove DC-NNN[/]\n")
 
     # ---- ACTIVE ----
     if show_active or filter_class == SafetyClassification.ACTIVE:
-        active = groups[SafetyClassification.ACTIVE]
+        console.rule()
+        console.print()
+        console.print(f"[{STYLE_ACTIVE}]ACTIVE CANDIDATES[/]  ({len(active)} candidates)\n")
         if active:
-            console.print(f"[{STYLE_ACTIVE}]ACTIVE[/]    ({len(active)} candidates)\n")
             for dc_id, cand in active:
                 _print_active_card(dc_id, cand, repo_root)
+        else:
+            console.print("  [dim](none)[/]\n")
 
     state_file = state_path(repo_root)
-    console.print(f"\n  State saved : [dim]{state_file}[/]")
-    console.print(
-        "  Run [bold]deadcode show DC-NNN[/] to inspect a candidate.\n"
-        "  Run [bold]deadcode prove DC-NNN[/] to attempt proof.\n"
-    )
+    console.print(f"  State saved : [dim]{state_file}[/]\n")
 
 
 def _print_provable_card(dc_id: str, cand, repo_root: Path) -> None:

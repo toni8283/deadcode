@@ -189,18 +189,31 @@ class TestScanOutput:
         _make_simple_project(tmp_path)
         result = runner.invoke(app, ["scan", str(tmp_path)])
         # ACTIVE section should not appear at all without --active flag
-        assert "ACTIVE" not in result.output
+        assert "ACTIVE CANDIDATES" not in result.output
 
     def test_active_shown_with_flag(self, tmp_path):
         _make_simple_project(tmp_path)
         result = runner.invoke(app, ["scan", str(tmp_path), "--active"])
-        assert "ACTIVE" in result.output
+        assert "ACTIVE CANDIDATES" in result.output
+        assert "used_fn" in result.output
 
     def test_only_filter_provable(self, tmp_path):
         _make_simple_project(tmp_path)
         result = runner.invoke(app, ["scan", str(tmp_path), "--only", "PROVABLE"])
         assert result.exit_code == 0
         assert "PROVABLE" in result.output
+
+    def test_only_filter_review(self, tmp_path):
+        _make_simple_project(tmp_path)
+        result = runner.invoke(app, ["scan", str(tmp_path), "--only", "REVIEW"])
+        assert result.exit_code == 0
+        assert "REVIEW" in result.output
+
+    def test_only_filter_active(self, tmp_path):
+        _make_simple_project(tmp_path)
+        result = runner.invoke(app, ["scan", str(tmp_path), "--only", "ACTIVE"])
+        assert result.exit_code == 0
+        assert "ACTIVE" in result.output
 
     def test_only_filter_invalid_exits_nonzero(self, tmp_path):
         _make_simple_project(tmp_path)
