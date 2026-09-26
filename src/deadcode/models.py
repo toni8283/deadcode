@@ -145,6 +145,7 @@ class ImportRecord:
     alias: str | None
     is_wildcard: bool
     location: Location
+    level: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +198,7 @@ class FileIndex:
     definitions: list[SymbolDef] = field(default_factory=list)
     imports: list[ImportRecord] = field(default_factory=list)
     references: list[SymbolRef] = field(default_factory=list)
+    imported_modules: set[str] = field(default_factory=set)
     has_wildcard_import: bool = False
     all_names: list[str] | None = None          # contents of __all__, or None
     parse_error: str | None = None              # error message if AST parse failed

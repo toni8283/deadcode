@@ -309,11 +309,13 @@ class _FileVisitor(ast.NodeVisitor):
                 alias=alias.asname,
                 is_wildcard=False,
                 location=self._loc(node),
+                level=0,
             )
             self.imports.append(record)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = node.module or ""
+        level = getattr(node, "level", 0) or 0
         is_wildcard = any(a.name == "*" for a in node.names)
 
         if is_wildcard:
@@ -324,6 +326,7 @@ class _FileVisitor(ast.NodeVisitor):
                 alias=None,
                 is_wildcard=True,
                 location=self._loc(node),
+                level=level,
             )
             self.imports.append(record)
         else:
@@ -334,6 +337,7 @@ class _FileVisitor(ast.NodeVisitor):
                     alias=alias.asname,
                     is_wildcard=False,
                     location=self._loc(node),
+                    level=level,
                 )
                 self.imports.append(record)
 

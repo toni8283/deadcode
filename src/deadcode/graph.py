@@ -140,6 +140,29 @@ class ReferenceGraph:
     nodes: dict[str, DefNode] = field(default_factory=dict)
     # Names referenced via wildcard imports (bare names only)
     wildcard_exposed_names: set[str] = field(default_factory=set)
+    # Module-level dependency graph:
+    # consumer_module -> set of target_modules it imports/depends on
+    module_dependencies: dict[str, set[str]] = field(default_factory=dict)
+    # target_module -> set of consumer_modules that import/depend on it
+    incoming_module_dependencies: dict[str, set[str]] = field(default_factory=dict)
+
+    def add_module_dependency(self, consumer_module: str, target_module: str) -> None:
+        """
+        Record a module-level dependency edge: consumer_module -> target_module.
+        Self-dependencies are ignored.
+        """
+        if not consumer_module or not target_module or consumer_module == target_module:
+            return
+        self.module_dependencies.setdefault(consumer_module, set()).add(target_module)
+        self.incoming_module_dependencies.setdefault(target_module, set()).add(consumer_module)
+
+    def get_module_dependencies(self, module_name: str) -> set[str]:
+        """Return the set of modules that *module_name* directly depends on."""
+        return set(self.module_dependencies.get(module_name, set()))
+
+    def get_incoming_module_dependencies(self, module_name: str) -> set[str]:
+        """Return the set of modules that directly depend on *module_name*."""
+        return set(self.incoming_module_dependencies.get(module_name, set()))
 
     def get_node(self, qualified_name: str) -> DefNode | None:
         return self.nodes.get(qualified_name)
@@ -174,12 +197,26 @@ def build_graph(index: RepoIndex) -> ReferenceGraph:
         graph.nodes[qname] = DefNode(definition=defn)
 
     # ----------------------------------------------------------------
-    # 2.  Wildcard-import uncertainty
+    # 2.  Lookup maps & Wildcard-import uncertainty
     # ----------------------------------------------------------------
+    # module_name → file_index for fast lookup
+    module_to_file: dict[str, FileIndex] = {
+        fi.module_name: fi for fi in index.files if fi.module_name
+    }
+
+    # bare_name → list[DefNode] (global, for fallback)
+    name_to_nodes: dict[str, list[DefNode]] = {}
+    for node in graph.nodes.values():
+        bare = node.definition.name
+        name_to_nodes.setdefault(bare, []).append(node)
+
     wildcard_source_modules: set[str] = set()
     for file_index in index.files:
         for imp in file_index.imports:
             if imp.is_wildcard:
+                target_fi = _resolve_module(imp.module, module_to_file, file_index, level=imp.level)
+                if target_fi is not None:
+                    wildcard_source_modules.add(target_fi.module_name)
                 wildcard_source_modules.add(imp.module)
 
     # Any definition in a module that is wildcard-imported is uncertain.
@@ -195,24 +232,7 @@ def build_graph(index: RepoIndex) -> ReferenceGraph:
     }
 
     # ----------------------------------------------------------------
-    # 3.  Per-file import maps
-    #     For each consumer file, build a map:
-    #       bare_name → list[qualified_name candidates]
-    #     derived from explicit import records.
-    # ----------------------------------------------------------------
-    # module_name → file_index for fast lookup
-    module_to_file: dict[str, FileIndex] = {
-        fi.module_name: fi for fi in index.files if fi.module_name
-    }
-
-    # bare_name → list[DefNode] (global, for fallback)
-    name_to_nodes: dict[str, list[DefNode]] = {}
-    for node in graph.nodes.values():
-        bare = node.definition.name
-        name_to_nodes.setdefault(bare, []).append(node)
-
-    # ----------------------------------------------------------------
-    # 4.  Resolve references → nodes
+    # 3.  Resolve references → nodes
     # ----------------------------------------------------------------
     for file_index in index.files:
         is_test = _is_test_file(file_index.path)
@@ -221,7 +241,7 @@ def build_graph(index: RepoIndex) -> ReferenceGraph:
         # Maps:  local_name → list[DefNode]  (resolved to local-repo defs)
         # Also:  local_name → "ambiguous" | "external" | "wildcard"
         import_map, ambiguous_names, external_names = _build_import_map(
-            file_index, module_to_file, graph.nodes, name_to_nodes
+            file_index, module_to_file, graph.nodes, name_to_nodes, graph=graph
         )
 
         for ref in file_index.references:
@@ -295,6 +315,7 @@ def _build_import_map(
     module_to_file: dict[str, FileIndex],
     all_nodes: dict[str, DefNode],
     name_to_nodes: dict[str, list[DefNode]],
+    graph: ReferenceGraph | None = None,
 ) -> tuple[
     dict[str, list[DefNode]],   # name → resolved DefNode list (pinned)
     set[str],                    # names that are ambiguous
@@ -317,57 +338,94 @@ def _build_import_map(
     import_map: dict[str, list[DefNode]] = {}
     ambiguous_names: set[str] = set()
     external_names: set[str] = set()
+    consumer_module = file_index.module_name or ""
 
     for imp in file_index.imports:
+        level = getattr(imp, "level", 0)
+
+        # ---- Wildcard imports: ``from M import *`` ----
         if imp.is_wildcard:
-            # Wildcards are handled separately (uncertainty flag on source).
+            target_fi = _resolve_module(imp.module, module_to_file, file_index, level=level)
+            if target_fi is not None:
+                if graph is not None:
+                    graph.add_module_dependency(consumer_module, target_fi.module_name)
+                file_index.imported_modules.add(target_fi.module_name)
             continue
 
         # ---- ``from M import N [as A]`` ----
         if imp.names:
             module = imp.module
-            # Resolve the module to a local file index (if possible).
-            target_fi = _resolve_module(module, module_to_file, file_index)
+            target_fi = _resolve_module(module, module_to_file, file_index, level=level)
+
+            if level > 0:
+                resolved_base_mod = _resolve_relative_module(module, level, file_index)
+            else:
+                resolved_base_mod = target_fi.module_name if target_fi else module
 
             for name in imp.names:
                 local_name = imp.alias if imp.alias else name
 
+                # 1. First check if `name` is a symbol defined directly in target_fi
+                if target_fi is not None:
+                    expected_qname = f"{target_fi.module_name}.{name}"
+                    node = all_nodes.get(expected_qname)
+                    if node is not None:
+                        # Unambiguous: defined in target module
+                        import_map[local_name] = [node]
+                        if graph is not None:
+                            graph.add_module_dependency(consumer_module, target_fi.module_name)
+                        file_index.imported_modules.add(target_fi.module_name)
+                        continue
+
+                # 2. Only if `name` is not defined in target_fi, check if it refers to a local submodule
+                submodule_candidate = f"{resolved_base_mod}.{name}" if resolved_base_mod else None
+                submodule_fi = module_to_file.get(submodule_candidate) if submodule_candidate else None
+
+                if submodule_fi is not None:
+                    # Target is an indexed submodule
+                    if graph is not None:
+                        graph.add_module_dependency(consumer_module, submodule_fi.module_name)
+                    file_index.imported_modules.add(submodule_fi.module_name)
+                    external_names.add(local_name)
+                    continue
+
+                # 3. Neither a direct symbol definition in target_fi nor a local submodule
                 if target_fi is None:
                     # Module not in local repo — mark as external
                     external_names.add(local_name)
                     continue
 
-                # Look for `name` as a definition in target_fi's qualified ns
-                expected_qname = f"{target_fi.module_name}.{name}"
-                node = all_nodes.get(expected_qname)
+                # Target is an import from target_fi (e.g. re-export or dynamic attr)
+                if graph is not None:
+                    graph.add_module_dependency(consumer_module, target_fi.module_name)
+                file_index.imported_modules.add(target_fi.module_name)
 
-                if node is not None:
-                    # Unambiguous: exactly one local def
-                    import_map[local_name] = [node]
+                # The module exists locally but the name isn't defined there.
+                # Could be a re-export from a sub-module or a dynamic attr.
+                # Fail closed: check name_to_nodes for any same-name def.
+                candidates = name_to_nodes.get(name, [])
+                if len(candidates) == 1:
+                    # Only one def of this name anywhere — safe to pin
+                    import_map[local_name] = candidates
+                elif len(candidates) > 1:
+                    # Multiple defs — ambiguous
+                    ambiguous_names.add(local_name)
                 else:
-                    # The module exists locally but the name isn't defined there.
-                    # Could be a re-export from a sub-module or a dynamic attr.
-                    # Fail closed: check name_to_nodes for any same-name def.
-                    candidates = name_to_nodes.get(name, [])
-                    if len(candidates) == 1:
-                        # Only one def of this name anywhere — safe to pin
-                        import_map[local_name] = candidates
-                    elif len(candidates) > 1:
-                        # Multiple defs — ambiguous
-                        ambiguous_names.add(local_name)
-                    else:
-                        # Name not found in repo at all — external
-                        external_names.add(local_name)
+                    # Name not found in repo at all — external
+                    external_names.add(local_name)
 
         # ---- ``import M [as A]`` ----
         else:
             module = imp.module
             local_name = imp.alias if imp.alias else module.split(".")[0]
-            target_fi = _resolve_module(module, module_to_file, file_index)
+            target_fi = _resolve_module(module, module_to_file, file_index, level=0)
 
             if target_fi is None:
                 external_names.add(local_name)
             else:
+                if graph is not None:
+                    graph.add_module_dependency(consumer_module, target_fi.module_name)
+                file_index.imported_modules.add(target_fi.module_name)
                 # The import makes the module name available; attribute access
                 # like ``M.func()`` will have ``M`` as the bare Name node.
                 # We do NOT resolve the attribute chain — we only credit ``M``
@@ -379,33 +437,80 @@ def _build_import_map(
     return import_map, ambiguous_names, external_names
 
 
+def _resolve_relative_module(
+    module: str,
+    level: int,
+    consumer_fi: FileIndex | None,
+) -> str | None:
+    """
+    Resolve a relative import (level > 0) to a fully qualified dotted module name.
+
+    Parameters
+    ----------
+    module:
+        The module string from the import (may be empty for ``from . import x``).
+    level:
+        Number of leading dots (1 for '.', 2 for '..', etc.).
+    consumer_fi:
+        The FileIndex of the file containing the relative import.
+
+    Returns
+    -------
+    The resolved dotted module name, or None if the relative import cannot
+    be safely resolved (e.g. ascends beyond top-level package or no package context).
+    """
+    if level <= 0 or consumer_fi is None or not consumer_fi.module_name:
+        return None
+
+    is_init = Path(consumer_fi.path).name == "__init__.py"
+    if is_init:
+        if consumer_fi.module_name == "__init__":
+            return None
+        pkg_parts = consumer_fi.module_name.split(".")
+    else:
+        pkg_parts = consumer_fi.module_name.split(".")[:-1] if "." in consumer_fi.module_name else []
+
+    if not pkg_parts:
+        return None
+
+    ascend = level - 1
+    if ascend < 0 or ascend >= len(pkg_parts):
+        # Attempted relative import beyond top-level package
+        return None
+
+    base_parts = pkg_parts[: len(pkg_parts) - ascend]
+    if module:
+        target_parts = base_parts + module.split(".")
+    else:
+        target_parts = base_parts
+
+    return ".".join(target_parts)
+
+
 def _resolve_module(
     module: str,
     module_to_file: dict[str, FileIndex],
-    consumer_fi: FileIndex,
+    consumer_fi: FileIndex | None = None,
+    level: int = 0,
 ) -> FileIndex | None:
     """
     Try to resolve a module string to a local :class:`FileIndex`.
 
     Handles:
+    * Relative imports (level > 0) resolved using consumer_fi's package context.
     * Exact match: ``utils`` → module_name ``utils``
     * Dotted match: ``package.utils`` → module_name ``package.utils``
-    * Relative imports (level > 0) are not yet resolvable without the full
-      package structure — return None (fail closed).
-
-    Parameters
-    ----------
-    module:
-        The module string from the import record (may be empty for relative
-        imports captured as ``""``).
-    module_to_file:
-        Map of module_name → FileIndex for all local files.
-    consumer_fi:
-        The file doing the importing (used for relative resolution context,
-        currently unused — relative imports fall through to None).
+    * Suffix match: ``from utils import X`` where repo has ``mypackage.utils``.
     """
+    if level > 0:
+        if consumer_fi is None:
+            return None
+        resolved_name = _resolve_relative_module(module, level, consumer_fi)
+        if not resolved_name:
+            return None
+        return module_to_file.get(resolved_name)
+
     if not module:
-        # Relative import with empty module string — cannot resolve
         return None
 
     # Direct lookup
