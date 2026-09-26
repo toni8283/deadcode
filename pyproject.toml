@@ -23,6 +23,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v"
+norecursedirs = ["tests/fixtures"]
 
 [tool.coverage.run]
 source = ["deadcode"]

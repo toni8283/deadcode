@@ -166,11 +166,20 @@ class SymbolRef:
     context:
         Descriptive label for the kind of usage, e.g. ``"call"``,
         ``"attribute"``, ``"base_class"``, ``"decorator"``.
+    is_from_test:
+        ``True`` when this reference originates from a test file
+        (``test_*.py``, ``*_test.py``, or inside a ``tests/`` directory).
+    resolved_module:
+        When import-aware resolution pinned this reference to a specific
+        module (e.g. ``utils``), that module name is stored here.
+        ``None`` means the resolution fell back to bare-name matching.
     """
 
     name: str
     location: Location
     context: str = "name"
+    is_from_test: bool = False
+    resolved_module: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -229,11 +238,41 @@ class Candidate:
     """
     A symbol flagged as potentially unused, together with the evidence and
     final classification.
+
+    Structured evidence fields
+    --------------------------
+    These mirror the prose ``evidence`` list but in machine-readable form,
+    sufficient for a CLI to render a rich explanation without re-parsing.
+
+    ref_count:
+        Total number of static references found (0 for PROVABLE/REVIEW).
+    ref_locations:
+        List of (file, line) pairs for every reference site found.
+    test_ref_count:
+        Number of references that originate from test files.
+    import_relationships:
+        For each ``from module import name`` import that brought this
+        symbol's name into a consumer file, the importing module name
+        is recorded here.
+    is_exported:
+        ``True`` if the symbol is listed in its module's ``__all__``.
+        ``None`` if the module has no ``__all__``.
+    uncertainty_reasons:
+        Machine-readable list of REVIEW-trigger reason strings, e.g.
+        ``["wildcard_import", "has_decorator"]``.  Empty for PROVABLE/ACTIVE.
     """
 
     symbol: SymbolDef
     classification: SafetyClassification
     evidence: list[EvidenceItem] = field(default_factory=list)
+
+    # Structured evidence (machine-readable, JSON-serialisable)
+    ref_count: int = 0
+    ref_locations: list[dict[str, Any]] = field(default_factory=list)
+    test_ref_count: int = 0
+    import_relationships: list[str] = field(default_factory=list)
+    is_exported: bool | None = None   # mirrors symbol.in_all
+    uncertainty_reasons: list[str] = field(default_factory=list)
 
     # Derived convenience properties
     @property

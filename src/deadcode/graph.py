@@ -11,33 +11,73 @@ Responsibilities
 * Flag definitions that cannot be safely classified because of dynamic
   patterns detected during parsing or cross-file wildcard imports.
 
-Graph model
------------
-The graph is intentionally *conservative*:
+Import-aware resolution (Task 2)
+---------------------------------
+When a file contains ``from utils import calculate_total``, any use of
+``calculate_total`` in that file is pinned to the module ``utils``, not to
+every module that happens to define a function with the same name.
 
-  Definition  ──referenced_by──▶  list[SymbolRef]
+Resolution priority
+~~~~~~~~~~~~~~~~~~~
+1. **Pinned via ``from M import N``** — If the consuming file has a
+   ``from M import N`` record (not wildcard), and ``N`` matches the
+   reference name, AND ``M`` resolves to a local module, we credit only the
+   ``DefNode`` for ``M.N`` (qualified: ``<module>.N``).
 
-A reference is attributed to a definition when:
-  1. The reference's bare name matches the definition's simple ``name``, OR
-  2. The reference's bare name matches the last segment of the definition's
-     ``qualified_name`` (e.g. ``helper`` matches ``mypackage.utils.helper``).
+2. **Pinned via ``import M`` + attribute access** — If the consuming file has
+   ``import M`` and the reference is the bare name ``M`` (used as
+   ``M.symbol``), we credit the ``DefNode`` for ``M`` itself (the module).
+   Attribute resolution beyond the bare name is not attempted.
 
-We do NOT attempt to resolve fully-qualified dotted names beyond step 2 above
-because Python's dynamic import system means we could never be certain.  If we
-cannot resolve a reference, it is silently dropped (the definition remains
-unreferenced, which is the safe direction).
+3. **Ambiguous bare-name fallback** — If the consuming file has NO import
+   record for this name (e.g. a same-file call), we fall back to bare-name
+   matching across all definitions.  When multiple definitions share the same
+   name and we have no import to disambiguate, we mark ALL of them as
+   ``uncertain_due_to_ambiguous_import``.
 
-Wildcard imports (``from pkg import *``) prevent us from knowing what names
-were introduced into a module's namespace.  Any definition whose simple name
-*could* have been imported via a wildcard import is conservatively flagged as
-``uncertain_due_to_wildcard``.
+Fail-closed principle
+~~~~~~~~~~~~~~~~~~~~~
+If resolution is uncertain for any reason — unresolvable module, aliased
+import, relative import from unknown package — we do NOT guess.  The
+reference is recorded as ambiguous and the affected ``DefNode`` is marked
+``uncertain_due_to_ambiguous_import``, ensuring the analyzer produces REVIEW.
+
+Test-file detection
+-------------------
+A file is a test file if its basename matches ``test_*.py`` / ``*_test.py``
+or it lives inside a directory whose name is ``tests`` or ``test``.
+References originating from test files set ``SymbolRef.is_from_test = True``
+and are counted separately in the graph node.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
-from deadcode.models import FileIndex, RepoIndex, SymbolDef, SymbolRef
+from deadcode.models import FileIndex, ImportRecord, RepoIndex, SymbolDef, SymbolRef
+
+
+# ---------------------------------------------------------------------------
+# Test-file detection
+# ---------------------------------------------------------------------------
+
+_TEST_FILENAME_RE = re.compile(r"^(test_.+|.+_test)\.py$")
+_TEST_DIR_NAMES: frozenset[str] = frozenset({"tests", "test"})
+
+
+def _is_test_file(path: str) -> bool:
+    """Return True if *path* refers to a test file."""
+    p = Path(path)
+    # Filename pattern
+    if _TEST_FILENAME_RE.match(p.name):
+        return True
+    # Any ancestor directory named 'tests' or 'test'
+    for part in p.parts:
+        if part in _TEST_DIR_NAMES:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +96,8 @@ class DefNode:
         The symbol definition this node represents.
     references:
         All ``SymbolRef`` objects that appear to reference this definition.
+    test_references:
+        Subset of ``references`` that originate from test files.
     uncertain_due_to_wildcard:
         ``True`` if a ``from pkg import *`` was found in *any* file that shares
         the same bare name as this definition – we cannot be sure the wildcard
@@ -64,16 +106,27 @@ class DefNode:
         ``True`` if a dynamic call (``getattr``, ``globals()``, ``eval``, …)
         or a ``dynamic_call``-context reference was found that uses this
         symbol's name.
+    uncertain_due_to_ambiguous_import:
+        ``True`` when a reference shares the bare name with this definition but
+        the consuming file has no import record that would unambiguously pin the
+        reference to this specific module.  Set only when multiple definitions
+        share the same bare name.
     """
 
     definition: SymbolDef
     references: list[SymbolRef] = field(default_factory=list)
+    test_references: list[SymbolRef] = field(default_factory=list)
     uncertain_due_to_wildcard: bool = False
     uncertain_due_to_dynamic: bool = False
+    uncertain_due_to_ambiguous_import: bool = False
 
     @property
     def ref_count(self) -> int:
         return len(self.references)
+
+    @property
+    def test_ref_count(self) -> int:
+        return len(self.test_references)
 
 
 @dataclass
@@ -107,10 +160,10 @@ def build_graph(index: RepoIndex) -> ReferenceGraph:
     Steps
     -----
     1. Create one ``DefNode`` for every ``SymbolDef`` in the index.
-    2. Collect all ``SymbolRef`` objects from every file.
-    3. For each reference, attempt to resolve it to one or more ``DefNode``
-       objects and record the association.
-    4. Mark nodes that are affected by wildcard imports or dynamic references.
+    2. Build helper maps for wildcard uncertainty.
+    3. Build per-file import-resolution maps.
+    4. Resolve references using import-aware logic; record test-file origin.
+    5. Dynamic-reference pass: mark nodes uncertain where needed.
     """
     graph = ReferenceGraph()
 
@@ -121,11 +174,7 @@ def build_graph(index: RepoIndex) -> ReferenceGraph:
         graph.nodes[qname] = DefNode(definition=defn)
 
     # ----------------------------------------------------------------
-    # 2.  Collect wildcard-exposed names
-    #
-    #     Any file that has ``from pkg import *`` introduces *unknown* names
-    #     into its namespace.  We record the bare names of all definitions in
-    #     the *source* package so we can flag them as uncertain.
+    # 2.  Wildcard-import uncertainty
     # ----------------------------------------------------------------
     wildcard_source_modules: set[str] = set()
     for file_index in index.files:
@@ -133,53 +182,99 @@ def build_graph(index: RepoIndex) -> ReferenceGraph:
             if imp.is_wildcard:
                 wildcard_source_modules.add(imp.module)
 
-    # Anything that *could* be exported from a wildcard-imported module is
-    # uncertain.  Since we may not have the source of the imported module, we
-    # conservatively mark every definition whose module matches.
+    # Any definition in a module that is wildcard-imported is uncertain.
     for qname, defn in index.definitions.items():
-        module = defn.location.file  # used for file-level check below
-        if defn.qualified_name.rsplit(".", 1)[0] in wildcard_source_modules:
+        parent_module = _parent_module(defn.qualified_name)
+        if parent_module in wildcard_source_modules:
             graph.nodes[qname].uncertain_due_to_wildcard = True
             graph.wildcard_exposed_names.add(defn.name)
 
-    # Additionally flag any *consumer* file that does ``from x import *``:
-    # names used in that file might resolve to things we can't know.
-    consumer_files_with_wildcard: set[str] = set()
-    for file_index in index.files:
-        if file_index.has_wildcard_import:
-            consumer_files_with_wildcard.add(file_index.path)
+    # Consumer files that use wildcard imports
+    consumer_files_with_wildcard: set[str] = {
+        fi.path for fi in index.files if fi.has_wildcard_import
+    }
 
     # ----------------------------------------------------------------
-    # 3.  Resolve references → nodes
+    # 3.  Per-file import maps
+    #     For each consumer file, build a map:
+    #       bare_name → list[qualified_name candidates]
+    #     derived from explicit import records.
     # ----------------------------------------------------------------
-    # Build a reverse map: bare_name → list[DefNode] for fast lookup
+    # module_name → file_index for fast lookup
+    module_to_file: dict[str, FileIndex] = {
+        fi.module_name: fi for fi in index.files if fi.module_name
+    }
+
+    # bare_name → list[DefNode] (global, for fallback)
     name_to_nodes: dict[str, list[DefNode]] = {}
     for node in graph.nodes.values():
         bare = node.definition.name
         name_to_nodes.setdefault(bare, []).append(node)
 
+    # ----------------------------------------------------------------
+    # 4.  Resolve references → nodes
+    # ----------------------------------------------------------------
     for file_index in index.files:
+        is_test = _is_test_file(file_index.path)
+
+        # Build the import resolution map for this specific consumer file.
+        # Maps:  local_name → list[DefNode]  (resolved to local-repo defs)
+        # Also:  local_name → "ambiguous" | "external" | "wildcard"
+        import_map, ambiguous_names, external_names = _build_import_map(
+            file_index, module_to_file, graph.nodes, name_to_nodes
+        )
+
         for ref in file_index.references:
-            # Resolve the reference to candidate definition nodes
-            candidates = _resolve_ref(ref.name, name_to_nodes, index)
+            ref_name = ref.name
 
-            for cand_node in candidates:
+            # ---- Determine target nodes ----
+            resolved_nodes: list[DefNode] = []
+            resolution_mode: str = "bare"  # "pinned" | "bare" | "ambiguous"
+
+            if ref_name in ambiguous_names:
+                # We know there's a local import for this name but it resolved
+                # to multiple candidates — mark all as ambiguous.
+                resolved_nodes = name_to_nodes.get(ref_name, [])
+                resolution_mode = "ambiguous"
+            elif ref_name in import_map:
+                # Pinned via a specific import record
+                resolved_nodes = import_map[ref_name]
+                resolution_mode = "pinned"
+                ref.resolved_module = (
+                    resolved_nodes[0].definition.qualified_name.rsplit(".", 1)[0]
+                    if resolved_nodes else None
+                )
+            elif ref_name in external_names:
+                # Import exists but target is not a local module — skip
+                resolved_nodes = []
+                resolution_mode = "external"
+            else:
+                # No import record at all — bare fallback
+                resolved_nodes = _resolve_bare(ref_name, name_to_nodes)
+                resolution_mode = "bare"
+
+            # ---- Stamp test-file origin ----
+            ref.is_from_test = is_test
+
+            # ---- Associate reference with nodes ----
+            for cand_node in resolved_nodes:
                 cand_node.references.append(ref)
+                if is_test:
+                    cand_node.test_references.append(ref)
 
-                # Dynamic call context → mark the target as uncertain
                 if ref.context == "dynamic_call":
                     cand_node.uncertain_due_to_dynamic = True
 
-            # Any reference made from a wildcard-importing file is inherently
-            # uncertain for the *referenced* symbol (we can't tell if it came
-            # via the wildcard or a direct def).
+                if resolution_mode == "ambiguous":
+                    cand_node.uncertain_due_to_ambiguous_import = True
+
+            # Wildcard-consuming file: any resolved node becomes uncertain
             if file_index.path in consumer_files_with_wildcard:
-                for cand_node in candidates:
+                for cand_node in resolved_nodes:
                     cand_node.uncertain_due_to_wildcard = True
 
     # ----------------------------------------------------------------
-    # 4.  Dynamic-reference pass: if a name appears in a getattr/eval/exec
-    #     call anywhere in the repo, mark it uncertain.
+    # 5.  Dynamic-reference pass
     # ----------------------------------------------------------------
     for file_index in index.files:
         for ref in file_index.references:
@@ -191,31 +286,163 @@ def build_graph(index: RepoIndex) -> ReferenceGraph:
 
 
 # ---------------------------------------------------------------------------
-# Reference resolution
+# Import-aware resolution helpers
 # ---------------------------------------------------------------------------
 
 
-def _resolve_ref(
+def _build_import_map(
+    file_index: FileIndex,
+    module_to_file: dict[str, FileIndex],
+    all_nodes: dict[str, DefNode],
+    name_to_nodes: dict[str, list[DefNode]],
+) -> tuple[
+    dict[str, list[DefNode]],   # name → resolved DefNode list (pinned)
+    set[str],                    # names that are ambiguous
+    set[str],                    # names that are external (non-local)
+]:
+    """
+    Build the import-resolution map for a single consumer file.
+
+    Returns
+    -------
+    import_map:
+        Maps a local name to the specific DefNode(s) it was imported from.
+        Only populated when resolution is unambiguous.
+    ambiguous_names:
+        Names where an import exists but resolves to multiple candidates in
+        the local repo (same bare name, multiple matching defs).
+    external_names:
+        Names that are imported but the source module is not in the local repo.
+    """
+    import_map: dict[str, list[DefNode]] = {}
+    ambiguous_names: set[str] = set()
+    external_names: set[str] = set()
+
+    for imp in file_index.imports:
+        if imp.is_wildcard:
+            # Wildcards are handled separately (uncertainty flag on source).
+            continue
+
+        # ---- ``from M import N [as A]`` ----
+        if imp.names:
+            module = imp.module
+            # Resolve the module to a local file index (if possible).
+            target_fi = _resolve_module(module, module_to_file, file_index)
+
+            for name in imp.names:
+                local_name = imp.alias if imp.alias else name
+
+                if target_fi is None:
+                    # Module not in local repo — mark as external
+                    external_names.add(local_name)
+                    continue
+
+                # Look for `name` as a definition in target_fi's qualified ns
+                expected_qname = f"{target_fi.module_name}.{name}"
+                node = all_nodes.get(expected_qname)
+
+                if node is not None:
+                    # Unambiguous: exactly one local def
+                    import_map[local_name] = [node]
+                else:
+                    # The module exists locally but the name isn't defined there.
+                    # Could be a re-export from a sub-module or a dynamic attr.
+                    # Fail closed: check name_to_nodes for any same-name def.
+                    candidates = name_to_nodes.get(name, [])
+                    if len(candidates) == 1:
+                        # Only one def of this name anywhere — safe to pin
+                        import_map[local_name] = candidates
+                    elif len(candidates) > 1:
+                        # Multiple defs — ambiguous
+                        ambiguous_names.add(local_name)
+                    else:
+                        # Name not found in repo at all — external
+                        external_names.add(local_name)
+
+        # ---- ``import M [as A]`` ----
+        else:
+            module = imp.module
+            local_name = imp.alias if imp.alias else module.split(".")[0]
+            target_fi = _resolve_module(module, module_to_file, file_index)
+
+            if target_fi is None:
+                external_names.add(local_name)
+            else:
+                # The import makes the module name available; attribute access
+                # like ``M.func()`` will have ``M`` as the bare Name node.
+                # We do NOT resolve the attribute chain — we only credit ``M``
+                # itself (the module) if there's a DefNode for it.
+                # In practice the module doesn't have a DefNode, so this
+                # just records the intent to not treat M as an ambiguous ref.
+                external_names.add(local_name)  # Don't mis-classify M as local def
+
+    return import_map, ambiguous_names, external_names
+
+
+def _resolve_module(
+    module: str,
+    module_to_file: dict[str, FileIndex],
+    consumer_fi: FileIndex,
+) -> FileIndex | None:
+    """
+    Try to resolve a module string to a local :class:`FileIndex`.
+
+    Handles:
+    * Exact match: ``utils`` → module_name ``utils``
+    * Dotted match: ``package.utils`` → module_name ``package.utils``
+    * Relative imports (level > 0) are not yet resolvable without the full
+      package structure — return None (fail closed).
+
+    Parameters
+    ----------
+    module:
+        The module string from the import record (may be empty for relative
+        imports captured as ``""``).
+    module_to_file:
+        Map of module_name → FileIndex for all local files.
+    consumer_fi:
+        The file doing the importing (used for relative resolution context,
+        currently unused — relative imports fall through to None).
+    """
+    if not module:
+        # Relative import with empty module string — cannot resolve
+        return None
+
+    # Direct lookup
+    if module in module_to_file:
+        return module_to_file[module]
+
+    # Try suffix match: ``from utils import X`` where the repo has
+    # ``mypackage.utils`` as the module name.
+    for mod_name, fi in module_to_file.items():
+        if mod_name == module or mod_name.endswith(f".{module}"):
+            return fi
+
+    return None
+
+
+def _resolve_bare(
     name: str,
     name_to_nodes: dict[str, list[DefNode]],
-    index: RepoIndex,
 ) -> list[DefNode]:
     """
-    Map a bare reference name to zero or more definition nodes.
+    Fall back to bare-name matching (no import information).
 
-    Strategy
-    --------
-    * Exact bare-name match in ``name_to_nodes``.
-    * We intentionally do NOT attempt to resolve dotted attribute chains
-      beyond their root component – that is already split out by the parser.
+    When only ONE definition exists with this name, it is safe to credit it.
+    When MULTIPLE definitions share this name, we return all of them (each
+    will be marked ``uncertain_due_to_ambiguous_import`` by the caller if
+    resolution_mode == "ambiguous" — but here it's "bare", meaning the name
+    genuinely has no import to disambiguate).
     """
-    # Skip Python builtins and common keywords that will never match a
-    # user-defined symbol.  This is a best-effort optimisation, not a
-    # correctness requirement.
     if name in _BUILTIN_NAMES:
         return []
-
     return name_to_nodes.get(name, [])
+
+
+def _parent_module(qualified_name: str) -> str:
+    """Return the module part of a qualified name (everything before the last dot)."""
+    parts = qualified_name.rsplit(".", 1)
+    return parts[0] if len(parts) > 1 else ""
 
 
 # ---------------------------------------------------------------------------

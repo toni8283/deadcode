@@ -56,7 +56,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from deadcode.graph import DefNode, ReferenceGraph, build_graph
+from deadcode.graph import DefNode, ReferenceGraph, _is_test_file, build_graph
 from deadcode.indexer import build_index
 from deadcode.models import (
     AnalysisResult,
@@ -191,15 +191,34 @@ def _classify_all(index: RepoIndex, graph: ReferenceGraph) -> list[Candidate]:
         if _should_skip(defn, file_index):
             continue
 
-        classification, evidence = _classify_node(
+        classification, evidence, uncertainty_reasons = _classify_node(
             node, defn, file_index, error_files
         )
+
+        # ---- Structured evidence fields ----
+        ref_locations = [
+            {"file": r.location.file, "line": r.location.line, "context": r.context}
+            for r in node.references
+        ]
+
+        # Import relationships: modules that imported this symbol's name
+        import_relationships: list[str] = sorted({
+            r.resolved_module
+            for r in node.references
+            if r.resolved_module is not None
+        })
 
         candidates.append(
             Candidate(
                 symbol=defn,
                 classification=classification,
                 evidence=evidence,
+                ref_count=node.ref_count,
+                ref_locations=ref_locations,
+                test_ref_count=node.test_ref_count,
+                import_relationships=import_relationships,
+                is_exported=defn.in_all,
+                uncertainty_reasons=uncertainty_reasons,
             )
         )
 
@@ -246,11 +265,13 @@ def _classify_node(
     defn: SymbolDef,
     file_index: FileIndex | None,
     error_files: set[str],
-) -> tuple[SafetyClassification, list[EvidenceItem]]:
+) -> tuple[SafetyClassification, list[EvidenceItem], list[str]]:
     """
     Apply the fail-closed classification rules to one node.
 
-    Returns ``(classification, evidence_list)``.
+    Returns ``(classification, evidence_list, uncertainty_reason_strings)``.
+    The third element mirrors the REVIEW triggers as machine-readable strings,
+    used to populate ``Candidate.uncertainty_reasons``.
     """
     evidence: list[EvidenceItem] = []
     review_reasons: list[EvidenceItem] = []
@@ -277,7 +298,7 @@ def _classify_node(
             )
         )
 
-    # 3. Listed in __all__
+    # 3. Listed in __all__ — must never be PROVABLE
     if defn.in_all:
         review_reasons.append(
             EvidenceItem(
@@ -295,7 +316,7 @@ def _classify_node(
             )
         )
 
-    # 5. Dynamic reference uncertainty (external: another symbol references this one via dynamic call)
+    # 5. Dynamic reference uncertainty (external)
     if node.uncertain_due_to_dynamic:
         review_reasons.append(
             EvidenceItem(
@@ -304,7 +325,7 @@ def _classify_node(
             )
         )
 
-    # 5b. Symbol itself contains dynamic calls (internal: the function body uses dynamic access)
+    # 5b. Symbol body contains dynamic calls (internal)
     if defn.contains_dynamic_call:
         review_reasons.append(
             EvidenceItem(
@@ -322,7 +343,7 @@ def _classify_node(
             )
         )
 
-    # 7. File had parse error – symbols from it cannot be trusted
+    # 7. File had parse error
     if defn.location.file in error_files:
         review_reasons.append(
             EvidenceItem(
@@ -340,23 +361,56 @@ def _classify_node(
             )
         )
 
+    # 9. Ambiguous import resolution (same name in multiple modules, no
+    #    unambiguous import record to pin the reference)
+    if node.uncertain_due_to_ambiguous_import:
+        review_reasons.append(
+            EvidenceItem(
+                reason="ambiguous_import",
+                detail=(
+                    "Multiple modules define a symbol with this name and no "
+                    "unambiguous import record could pin the reference"
+                ),
+            )
+        )
+
     # ------------------------------------------------------------------
     # Determine classification
     # ------------------------------------------------------------------
 
     has_references = node.ref_count > 0
+    has_test_refs_only = has_references and node.ref_count == node.test_ref_count
+
+    # Symbols referenced ONLY from test files are not PROVABLE — they may
+    # be the primary exercised interface of a module.  Record as REVIEW
+    # (even if also referenced from non-test code, we still report ACTIVE).
+    if has_test_refs_only and not review_reasons:
+        review_reasons.append(
+            EvidenceItem(
+                reason="only_test_references",
+                detail=(
+                    f"Symbol has {node.test_ref_count} reference(s) but all originate "
+                    "from test files; cannot prove it is unused in production code"
+                ),
+            )
+        )
+
+    # Build the machine-readable uncertainty reason list
+    uncertainty_reasons = [e.reason for e in review_reasons]
 
     if has_references:
-        # ACTIVE wins even if there are review triggers, because we have
-        # positive evidence of use.
+        # ACTIVE: positive evidence of use (test-only refs are still ACTIVE)
         evidence.append(
             EvidenceItem(
                 reason="referenced",
-                detail=f"{node.ref_count} reference(s) found",
+                detail=(
+                    f"{node.ref_count} reference(s) found"
+                    + (f" ({node.test_ref_count} from tests)" if node.test_ref_count else "")
+                ),
             )
         )
         evidence.extend(review_reasons)
-        return SafetyClassification.ACTIVE, evidence
+        return SafetyClassification.ACTIVE, evidence, uncertainty_reasons
 
     # No references found
     evidence.append(
@@ -368,7 +422,7 @@ def _classify_node(
 
     if review_reasons:
         evidence.extend(review_reasons)
-        return SafetyClassification.REVIEW, evidence
+        return SafetyClassification.REVIEW, evidence, uncertainty_reasons
 
     # Zero references, no uncertainty triggers → PROVABLE
     evidence.append(
@@ -377,7 +431,7 @@ def _classify_node(
             detail="Symbol has no detected references and no uncertainty factors",
         )
     )
-    return SafetyClassification.PROVABLE, evidence
+    return SafetyClassification.PROVABLE, evidence, uncertainty_reasons
 
 
 # ---------------------------------------------------------------------------
