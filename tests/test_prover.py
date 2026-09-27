@@ -922,6 +922,246 @@ class TestRemoverUnit:
 
         assert f.read_text() == original
 
+    def test_remove_class_method_preserves_class_structure(self, tmp_path):
+        src = textwrap.dedent("""\
+            class FizzbarIdResource:
+                def get(self, id):
+                    return id
+
+                def delete(self, id):
+                    return {"deleted": id}
+
+                def post(self, id):
+                    return id
+        """)
+        f = tmp_path / "app.py"
+        f.write_text(src)
+
+        from deadcode.models import (
+            Candidate, Location, SafetyClassification, SymbolDef, SymbolKind
+        )
+        defn = SymbolDef(
+            name="delete",
+            qualified_name="app.FizzbarIdResource.delete",
+            kind=SymbolKind.FUNCTION,
+            location=Location(file=str(f), line=5),
+        )
+        cand = Candidate(symbol=defn, classification=SafetyClassification.PROVABLE)
+        lines_removed = remove_candidate(cand, tmp_path)
+        assert lines_removed == 2
+
+        remaining = f.read_text()
+        assert "def delete" not in remaining
+        assert "def get" in remaining
+        assert "def post" in remaining
+        assert "class FizzbarIdResource:" in remaining
+        ast.parse(remaining)
+
+    def test_remove_class_method_with_decorators(self, tmp_path):
+        src = textwrap.dedent("""\
+            def dec(fn): return fn
+
+            class Resource:
+                def get(self):
+                    return 1
+
+                @staticmethod
+                @dec
+                def delete():
+                    return 2
+        """)
+        f = tmp_path / "app.py"
+        f.write_text(src)
+
+        from deadcode.models import (
+            Candidate, Location, SafetyClassification, SymbolDef, SymbolKind
+        )
+        defn = SymbolDef(
+            name="delete",
+            qualified_name="app.Resource.delete",
+            kind=SymbolKind.FUNCTION,
+            location=Location(file=str(f), line=9),
+        )
+        cand = Candidate(symbol=defn, classification=SafetyClassification.PROVABLE)
+        remove_candidate(cand, tmp_path)
+
+        remaining = f.read_text()
+        assert "@staticmethod" not in remaining
+        assert "@dec" not in remaining
+        assert "def delete" not in remaining
+        assert "def get" in remaining
+        ast.parse(remaining)
+
+    def test_remove_only_method_in_class_inserts_pass(self, tmp_path):
+        src = textwrap.dedent("""\
+            class OnlyDelete:
+                def delete(self):
+                    return True
+        """)
+        f = tmp_path / "app.py"
+        f.write_text(src)
+
+        from deadcode.models import (
+            Candidate, Location, SafetyClassification, SymbolDef, SymbolKind
+        )
+        defn = SymbolDef(
+            name="delete",
+            qualified_name="app.OnlyDelete.delete",
+            kind=SymbolKind.FUNCTION,
+            location=Location(file=str(f), line=2),
+        )
+        cand = Candidate(symbol=defn, classification=SafetyClassification.PROVABLE)
+        remove_candidate(cand, tmp_path)
+
+        remaining = f.read_text()
+        assert "def delete" not in remaining
+        assert "class OnlyDelete:" in remaining
+        assert "pass" in remaining
+        ast.parse(remaining)
+
+    def test_remove_async_class_method(self, tmp_path):
+        src = textwrap.dedent("""\
+            class AsyncResource:
+                async def get(self):
+                    return 1
+
+                async def delete(self):
+                    return 2
+        """)
+        f = tmp_path / "app.py"
+        f.write_text(src)
+
+        from deadcode.models import (
+            Candidate, Location, SafetyClassification, SymbolDef, SymbolKind
+        )
+        defn = SymbolDef(
+            name="delete",
+            qualified_name="app.AsyncResource.delete",
+            kind=SymbolKind.ASYNC_FUNCTION,
+            location=Location(file=str(f), line=5),
+        )
+        cand = Candidate(symbol=defn, classification=SafetyClassification.PROVABLE)
+        lines_removed = remove_candidate(cand, tmp_path)
+        assert lines_removed == 2
+
+        remaining = f.read_text()
+        assert "async def delete" not in remaining
+        assert "async def get" in remaining
+        ast.parse(remaining)
+
+    def test_remove_nested_class_method(self, tmp_path):
+        src = textwrap.dedent("""\
+            class Outer:
+                class Inner:
+                    def unused_method(self):
+                        pass
+
+                    def keep(self):
+                        pass
+        """)
+        f = tmp_path / "app.py"
+        f.write_text(src)
+
+        from deadcode.models import (
+            Candidate, Location, SafetyClassification, SymbolDef, SymbolKind
+        )
+        defn = SymbolDef(
+            name="unused_method",
+            qualified_name="app.Outer.Inner.unused_method",
+            kind=SymbolKind.FUNCTION,
+            location=Location(file=str(f), line=3),
+        )
+        cand = Candidate(symbol=defn, classification=SafetyClassification.PROVABLE)
+        remove_candidate(cand, tmp_path)
+
+        remaining = f.read_text()
+        assert "unused_method" not in remaining
+        assert "def keep" in remaining
+        ast.parse(remaining)
+
+    def test_remove_nested_function_in_function_rejected(self, tmp_path):
+        src = textwrap.dedent("""\
+            def outer():
+                def inner():
+                    return 1
+                return inner
+        """)
+        f = tmp_path / "app.py"
+        f.write_text(src)
+
+        from deadcode.models import (
+            Candidate, Location, SafetyClassification, SymbolDef, SymbolKind
+        )
+        defn = SymbolDef(
+            name="inner",
+            qualified_name="app.outer.inner",
+            kind=SymbolKind.FUNCTION,
+            location=Location(file=str(f), line=2),
+        )
+        cand = Candidate(symbol=defn, classification=SafetyClassification.PROVABLE)
+        with pytest.raises(RemovalError, match="nested definitions are not supported"):
+            remove_candidate(cand, tmp_path)
+
+    def test_ambiguous_class_method_fails_closed(self, tmp_path):
+        src = textwrap.dedent("""\
+            class Dup:
+                def delete(self):
+                    return 1
+
+                def delete(self):
+                    return 2
+        """)
+        f = tmp_path / "app.py"
+        f.write_text(src)
+
+        from deadcode.models import (
+            Candidate, Location, SafetyClassification, SymbolDef, SymbolKind
+        )
+        defn = SymbolDef(
+            name="delete",
+            qualified_name="app.Dup.delete",
+            kind=SymbolKind.FUNCTION,
+            location=Location(file=str(f), line=3),
+        )
+        cand = Candidate(symbol=defn, classification=SafetyClassification.PROVABLE)
+        with pytest.raises(RemovalError, match="cannot uniquely resolve"):
+            remove_candidate(cand, tmp_path)
+
+
+class TestClassMethodProverIntegration:
+    def test_prove_unused_class_method_success(self, tmp_path):
+        _init_repo(tmp_path)
+        _write(
+            tmp_path / "app.py",
+            """\
+            class FizzbarIdResource:
+                def get(self, id):
+                    return id
+
+                def delete(self, id):
+                    return {"deleted": id}
+            """,
+        )
+        _commit(tmp_path)
+
+        from deadcode import analyze_repo
+        from deadcode.models import SafetyClassification
+        result = analyze_repo(tmp_path)
+        cand = next(c for c in result.candidates if c.symbol.name == "delete")
+        assert cand.classification == SafetyClassification.PROVABLE
+        assert cand.symbol.qualified_name == "app.FizzbarIdResource.delete"
+
+        proof = prove_candidate(
+            tmp_path, cand, ProofOptions(run_tests=False, run_typecheck=False)
+        )
+        assert proof.status == ProofStatus.PROVEN
+        assert proof.removal is not None
+        assert proof.removal.lines_removed == 2
+
+        # Working tree must be unchanged!
+        original = (tmp_path / "app.py").read_text()
+        assert "def delete" in original
+
 
 # ===========================================================================
 # ProofResult model tests

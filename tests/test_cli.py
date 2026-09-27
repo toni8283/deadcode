@@ -554,6 +554,44 @@ class TestApplyConfirmed:
         )
         assert "APPLIED" in result.output or "removed" in result.output.lower()
 
+    def test_apply_yes_removes_class_method(self, tmp_path):
+        _make_simple_project(tmp_path)
+        # Add a class with an unused method
+        (tmp_path / "resource.py").write_text(
+            "class FizzbarResource:\n"
+            "    def get(self):\n"
+            "        return 1\n"
+            "    def delete(self):\n"
+            "        return 2\n"
+        )
+        scan_res = runner.invoke(app, ["scan", str(tmp_path)])
+        assert scan_res.exit_code == 0
+
+        state = _scan_and_get_state(tmp_path)
+        dc_id = next(
+            k for k, v in state["candidates"].items()
+            if v["name"] == "delete" and v["classification"] == "PROVABLE"
+        )
+
+        from deadcode.state import record_proof
+        record_proof(
+            tmp_path,
+            dc_id,
+            {
+                "status": "PROVEN",
+                "candidate_qualified_name": state["candidates"][dc_id]["qualified_name"],
+            },
+        )
+
+        apply_res = runner.invoke(app, ["apply", dc_id, "--path", str(tmp_path), "--yes"])
+        assert apply_res.exit_code == 0
+        assert "Removed" in apply_res.output
+
+        new_content = (tmp_path / "resource.py").read_text()
+        assert "def delete" not in new_content
+        assert "def get" in new_content
+        assert "class FizzbarResource:" in new_content
+
 
 # ===========================================================================
 # 13. CLI handles invalid repository path

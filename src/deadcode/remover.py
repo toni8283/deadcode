@@ -88,7 +88,7 @@ def remove_candidate(candidate: Candidate, worktree_root: str | Path) -> int:
     ):
         raise RemovalError(
             f"Unsupported symbol kind '{candidate.symbol.kind.value}' for "
-            f"'{candidate.qualified_name}'; only module-level functions, "
+            f"'{candidate.qualified_name}'; only functions, methods, "
             "classes, and modules are supported."
         )
 
@@ -150,8 +150,8 @@ def remove_candidate(candidate: Candidate, worktree_root: str | Path) -> int:
     # ----------------------------------------------------------------
     # 4.  Locate the definition
     # ----------------------------------------------------------------
-    node = _find_definition(tree, candidate)
-    if node is None:
+    node, parent = _find_definition(tree, candidate)
+    if node is None or parent is None:
         raise RemovalError(
             f"Cannot locate definition of '{candidate.symbol.name}' near line "
             f"{candidate.line} in '{wt_file}'.  The symbol may have already been "
@@ -159,11 +159,17 @@ def remove_candidate(candidate: Candidate, worktree_root: str | Path) -> int:
         )
 
     # ----------------------------------------------------------------
-    # 5.  Verify this is a module-level definition (depth 0)
+    # 5.  Verify this is a module-level definition or class method
     # ----------------------------------------------------------------
-    if not _is_module_level(tree, node):
+    is_module_level = isinstance(parent, ast.Module)
+    is_class_method = (
+        isinstance(parent, ast.ClassDef)
+        and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    )
+
+    if not (is_module_level or is_class_method):
         raise RemovalError(
-            f"'{candidate.symbol.name}' is not a module-level definition; "
+            f"'{candidate.symbol.name}' is not a module-level definition or class method; "
             "nested definitions are not supported."
         )
 
@@ -189,11 +195,36 @@ def remove_candidate(candidate: Candidate, worktree_root: str | Path) -> int:
     end_idx = last_line  # exclusive for slicing
 
     lines_removed = end_idx - start_idx
-    new_lines = lines[:start_idx] + lines[end_idx:]
+
+    # If removing a class method leaves the class body empty, preserve syntax with pass
+    if (
+        is_class_method
+        and isinstance(parent, ast.ClassDef)
+        and len(parent.body) == 1
+        and parent.body[0] is node
+    ):
+        def_line = lines[node.lineno - 1]
+        indent = def_line[: len(def_line) - len(def_line.lstrip())]
+        if not indent:
+            indent = " " * getattr(node, "col_offset", 4)
+        if not indent:
+            indent = "    "
+        replacement = [f"{indent}pass\n"]
+        new_lines = lines[:start_idx] + replacement + lines[end_idx:]
+    else:
+        new_lines = lines[:start_idx] + lines[end_idx:]
+
+    new_source = "".join(new_lines)
+    try:
+        ast.parse(new_source, filename=str(wt_file))
+    except SyntaxError as exc:
+        raise RemovalError(
+            f"Removal of '{candidate.qualified_name}' would result in invalid syntax at line {exc.lineno}: {exc.msg}"
+        ) from exc
 
     # Write the modified source back
     try:
-        wt_file.write_text("".join(new_lines), encoding="utf-8")
+        wt_file.write_text(new_source, encoding="utf-8")
     except OSError as exc:
         raise RemovalError(f"Cannot write '{wt_file}': {exc}") from exc
 
@@ -269,38 +300,80 @@ def _find_git_root(start: Path) -> Path | None:
 def _find_definition(
     tree: ast.Module,
     candidate: Candidate,
-) -> ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | None:
+) -> tuple[
+    ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | None,
+    ast.AST | None,
+]:
     """
-    Locate the AST node for the candidate at module level.
+    Locate the AST node corresponding to *candidate* and its parent AST node.
 
-    Match criteria (all must hold):
-    1. The node is a direct child of the module (module-level definition).
-    2. The node's name equals ``candidate.symbol.name``.
-    3. The node's kind (Function/AsyncFunction/Class) matches the candidate.
-    4. The node's ``lineno`` is within ±5 lines of ``candidate.line``
-       (allows for slight discrepancy due to decorators).
+    Match criteria:
+    1. The node type matches candidate.symbol.kind (Function/AsyncFunction/Class).
+    2. The node name equals candidate.symbol.name.
+    3. Scope hierarchy matches candidate.qualified_name (module-level or class method).
+    4. Line proximity: definition line or effective start line within ±10 lines of candidate.line.
+    5. Fails closed if multiple definitions match or none match.
     """
     target_name = candidate.symbol.name
     target_line = candidate.line
+    target_kind = candidate.symbol.kind
+    target_qname = candidate.qualified_name
 
-    for node in ast.iter_child_nodes(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            continue
+    all_classes = {
+        n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)
+    }
 
-        if node.name != target_name:
-            continue
+    matches: list[
+        tuple[ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef, ast.AST]
+    ] = []
 
-        # Kind check
-        expected_kinds = _kinds_for_node(node)
-        if candidate.symbol.kind not in expected_kinds:
-            continue
+    def _walk(parent: ast.AST, class_stack: list[str]) -> None:
+        for node in ast.iter_child_nodes(parent):
+            if isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                expected_kinds = _kinds_for_node(node)
+                if node.name == target_name and target_kind in expected_kinds:
+                    qual_suffix = ".".join(class_stack + [node.name])
+                    is_match = False
+                    if target_qname == qual_suffix:
+                        is_match = True
+                    elif target_qname.endswith("." + qual_suffix):
+                        prefix = target_qname[: -len(qual_suffix) - 1]
+                        parent_part = prefix.split(".")[-1]
+                        # If prefix ends with a class in the file, this node is at
+                        # the wrong nesting level (e.g. top-level def matching class method qname)
+                        if parent_part not in all_classes:
+                            is_match = True
 
-        # Line proximity – use the effective start (first decorator or def line)
-        effective_start = _effective_start_line(node)
-        if abs(effective_start - target_line) <= 10:
-            return node
+                    if is_match:
+                        effective_start = _effective_start_line(node)
+                        node_line = getattr(node, "lineno", effective_start)
+                        if (
+                            abs(node_line - target_line) <= 10
+                            or abs(effective_start - target_line) <= 10
+                            or (effective_start <= target_line <= node_line)
+                        ):
+                            matches.append((node, parent))
 
-    return None
+                # Recurse into classes and functions to locate definitions
+                if isinstance(node, ast.ClassDef):
+                    _walk(node, class_stack + [node.name])
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    _walk(node, class_stack)
+
+    _walk(tree, [])
+
+    if len(matches) == 1:
+        return matches[0]
+
+    if len(matches) > 1:
+        raise RemovalError(
+            f"Multiple definitions match '{target_qname}' near line {target_line}; "
+            "cannot uniquely resolve."
+        )
+
+    return None, None
 
 
 def _is_module_level(tree: ast.Module, target: ast.AST) -> bool:
