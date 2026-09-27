@@ -27,7 +27,7 @@ from rich.table import Table
 from rich.text import Text
 
 from deadcode.analyzer import analyze_repo
-from deadcode.models import SafetyClassification
+from deadcode.models import SafetyClassification, SymbolKind
 from deadcode.proof_models import ProofStatus, VerificationStatus
 from deadcode.prover import ProofOptions, prove_candidate
 from deadcode.remover import RemovalError, remove_candidate
@@ -594,6 +594,21 @@ def apply(
         )
         raise typer.Exit(code=2)
 
+    # Critical safety hardening: verify proof matches candidate
+    proof = get_proof(repo_root, candidate_id)
+    proof_qname = proof.get("candidate_qualified_name") if proof else None
+    if proof is None or (proof_qname is not None and proof_qname != cand.qualified_name):
+        console.print()
+        console.print(
+            Panel(
+                f"[bold yellow]BLOCKED[/]\n\n"
+                f"Stored proof for [bold]{candidate_id}[/] does not match candidate '{cand.qualified_name}'.\n\n"
+                "The scan state may be stale. Run [bold]deadcode scan[/] and re-prove.",
+                border_style="yellow",
+            )
+        )
+        raise typer.Exit(code=2)
+
     console.print()
     console.rule(f"[bold]APPLY {candidate_id}[/]")
     console.print()
@@ -621,7 +636,10 @@ def apply(
         )
         raise typer.Exit(code=1)
 
-    console.print(f"\n  {ICON_OK}  Removed {lines_removed} lines from [cyan]{rel_file}[/]")
+    if cand.symbol.kind == SymbolKind.MODULE:
+        console.print(f"\n  {ICON_OK}  Deleted module file [cyan]{rel_file}[/] ({lines_removed} lines)")
+    else:
+        console.print(f"\n  {ICON_OK}  Removed {lines_removed} lines from [cyan]{rel_file}[/]")
 
     # Re-scan to confirm
     with console.status("Re-scanning to confirm…", spinner="dots"):

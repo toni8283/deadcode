@@ -84,24 +84,56 @@ def remove_candidate(candidate: Candidate, worktree_root: str | Path) -> int:
         SymbolKind.FUNCTION,
         SymbolKind.ASYNC_FUNCTION,
         SymbolKind.CLASS,
+        SymbolKind.MODULE,
     ):
         raise RemovalError(
             f"Unsupported symbol kind '{candidate.symbol.kind.value}' for "
-            f"'{candidate.qualified_name}'; only module-level functions and "
-            "classes are supported."
+            f"'{candidate.qualified_name}'; only module-level functions, "
+            "classes, and modules are supported."
         )
 
     # ----------------------------------------------------------------
     # 2.  Map candidate's original file path to the worktree copy
     # ----------------------------------------------------------------
-    wt_file = _remap_to_worktree(candidate.file, worktree_root)
-    if not wt_file.exists():
+    wt_root = Path(worktree_root).resolve()
+    wt_file = _remap_to_worktree(candidate.file, wt_root).resolve()
+
+    # Ensure the resolved target remains inside the worktree
+    try:
+        wt_file.relative_to(wt_root)
+    except ValueError as exc:
         raise RemovalError(
-            f"Source file '{wt_file}' does not exist in the worktree."
+            f"Target file '{wt_file}' is outside worktree root '{wt_root}'."
+        ) from exc
+
+    # Refuse non-Python files
+    if wt_file.suffix != ".py":
+        raise RemovalError(
+            f"Refusing to remove non-Python file '{wt_file}'."
+        )
+
+    if not wt_file.exists() or not wt_file.is_file():
+        raise RemovalError(
+            f"Source file '{wt_file}' does not exist or is not a regular file in the worktree."
         )
 
     # ----------------------------------------------------------------
-    # 3.  Read and parse the worktree copy
+    # 3.  Handle MODULE removal (unlink file)
+    # ----------------------------------------------------------------
+    if candidate.symbol.kind == SymbolKind.MODULE:
+        try:
+            source = wt_file.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise RemovalError(f"Cannot read '{wt_file}': {exc}") from exc
+        lines_count = len(source.splitlines())
+        try:
+            wt_file.unlink()
+        except OSError as exc:
+            raise RemovalError(f"Cannot delete '{wt_file}': {exc}") from exc
+        return lines_count
+
+    # ----------------------------------------------------------------
+    # 4.  Read and parse the worktree copy (functions/classes)
     # ----------------------------------------------------------------
     try:
         source = wt_file.read_text(encoding="utf-8", errors="replace")
@@ -194,7 +226,7 @@ def _remap_to_worktree(original_file: str, worktree_root: Path) -> Path:
     If no ``.git`` can be found, use the path as-is if it is already under
     worktree_root; otherwise raise ``RemovalError``.
     """
-    orig = Path(original_file).resolve()
+    orig = Path(original_file)
 
     # Fast path: file is already inside the worktree (e.g. tests using tmpdir)
     try:
@@ -204,7 +236,8 @@ def _remap_to_worktree(original_file: str, worktree_root: Path) -> Path:
         pass
 
     # Walk up from original file to find the git root
-    git_root = _find_git_root(orig.parent)
+    orig_resolved = orig.resolve()
+    git_root = _find_git_root(orig_resolved.parent)
     if git_root is None:
         raise RemovalError(
             f"Cannot remap '{orig}' to worktree '{worktree_root}': "
@@ -212,7 +245,7 @@ def _remap_to_worktree(original_file: str, worktree_root: Path) -> Path:
         )
 
     try:
-        rel = orig.relative_to(git_root)
+        rel = orig_resolved.relative_to(git_root)
     except ValueError as exc:
         raise RemovalError(
             f"'{orig}' is not under detected git root '{git_root}'."

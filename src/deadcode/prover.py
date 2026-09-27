@@ -113,7 +113,12 @@ class ProofOptions:
 # ---------------------------------------------------------------------------
 
 _SUPPORTED_KINDS: frozenset[SymbolKind] = frozenset(
-    {SymbolKind.FUNCTION, SymbolKind.ASYNC_FUNCTION, SymbolKind.CLASS}
+    {
+        SymbolKind.FUNCTION,
+        SymbolKind.ASYNC_FUNCTION,
+        SymbolKind.CLASS,
+        SymbolKind.MODULE,
+    }
 )
 
 # ---------------------------------------------------------------------------
@@ -203,7 +208,7 @@ def prove_candidate(
     if candidate.symbol.kind not in _SUPPORTED_KINDS:
         return _blocked(
             f"Symbol kind '{candidate.symbol.kind.value}' is not yet supported "
-            "for removal.  Only module-level functions and classes are supported."
+            "for removal.  Only module-level functions, classes, and modules are supported."
         )
 
     # ----------------------------------------------------------------
