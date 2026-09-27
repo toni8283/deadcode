@@ -71,6 +71,19 @@ _STRING_REF_MARKERS: frozenset[str] = frozenset(
 )
 
 
+def _is_main_block(node: ast.If) -> bool:
+    """Detect `if __name__ == '__main__':` guards."""
+    test = node.test
+    if not isinstance(test, ast.Compare):
+        return False
+    if not all(isinstance(op, (ast.Eq, ast.Is)) for op in test.ops):
+        return False
+    nodes = [test.left, *test.comparators]
+    has_name = any(isinstance(n, ast.Name) and n.id == "__name__" for n in nodes)
+    has_main = any(isinstance(n, ast.Constant) and n.value == "__main__" for n in nodes)
+    return has_name and has_main
+
+
 # ---------------------------------------------------------------------------
 # Visitor
 # ---------------------------------------------------------------------------
@@ -98,6 +111,9 @@ class _FileVisitor(ast.NodeVisitor):
         self.references: list[SymbolRef] = []
         self.all_names: list[str] | None = None
         self.has_wildcard_import: bool = False
+        self.has_main_block: bool = False
+        self.has_unresolved_dynamic_import: bool = False
+        self.dynamic_import_targets: set[str] = set()
 
         # Depth tracker so we can distinguish top-level vs nested defs
         self._scope_depth: int = 0
@@ -106,6 +122,15 @@ class _FileVisitor(ast.NodeVisitor):
         self._scope_stack: list[str] = []
         # Track whether a dynamic call was seen inside the current function scope
         self._current_scope_has_dynamic: list[bool] = []
+
+    # ------------------------------------------------------------------
+    # Control flow visitors
+    # ------------------------------------------------------------------
+
+    def visit_If(self, node: ast.If) -> None:
+        if _is_main_block(node):
+            self.has_main_block = True
+        self.generic_visit(node)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -264,6 +289,17 @@ class _FileVisitor(ast.NodeVisitor):
                 if isinstance(target, ast.Name) and target.id == "__all__":
                     self.all_names = _extract_string_list(node.value)
 
+            # Check for plugin/registration string markers
+            for target in node.targets:
+                target_names = _extract_assigned_names(target)
+                if any(any(marker in t.lower() for marker in _STRING_REF_MARKERS) for t in target_names):
+                    str_list = _extract_string_list(node.value)
+                    if str_list:
+                        for s in str_list:
+                            self.dynamic_import_targets.add(s)
+                    elif isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                        self.dynamic_import_targets.add(node.value.value)
+
             # Record top-level variable definitions
             for target in node.targets:
                 for name_node in _extract_assigned_names(target):
@@ -384,6 +420,24 @@ class _FileVisitor(ast.NodeVisitor):
                             context="dynamic_call",
                         )
                     )
+
+        # Check for dynamic import calls: importlib.import_module or __import__
+        is_import_call = False
+        if isinstance(node.func, ast.Name) and node.func.id in ("__import__", "import_module"):
+            is_import_call = True
+        elif isinstance(node.func, ast.Attribute) and node.func.attr in ("import_module", "__import__"):
+            is_import_call = True
+
+        if is_import_call:
+            if node.args:
+                first = node.args[0]
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    self.dynamic_import_targets.add(first.value)
+                else:
+                    self.has_unresolved_dynamic_import = True
+            else:
+                self.has_unresolved_dynamic_import = True
+
         self.generic_visit(node)
 
     def visit_JoinedStr(self, node: ast.JoinedStr) -> None:
@@ -495,6 +549,11 @@ def parse_file(file_path: str | Path, module_name: str) -> FileIndex:
         index.parse_error = f"Cannot read file: {exc}"
         return index
 
+    # Check shebang on first line
+    lines = source.splitlines()
+    if lines and lines[0].startswith("#!"):
+        index.has_shebang = True
+
     # Parse AST
     try:
         tree = ast.parse(source, filename=path_str)
@@ -513,6 +572,9 @@ def parse_file(file_path: str | Path, module_name: str) -> FileIndex:
     index.imports = visitor.imports
     index.references = visitor.references
     index.has_wildcard_import = visitor.has_wildcard_import
+    index.has_main_block = visitor.has_main_block
+    index.has_unresolved_dynamic_import = visitor.has_unresolved_dynamic_import
+    index.dynamic_import_targets = visitor.dynamic_import_targets
     index.all_names = visitor.all_names
 
     # Propagate __all__ membership to definitions

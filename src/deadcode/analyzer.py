@@ -56,13 +56,20 @@ import json
 from pathlib import Path
 from typing import Any
 
-from deadcode.graph import DefNode, ReferenceGraph, _is_test_file, build_graph
+from deadcode.graph import (
+    DefNode,
+    ReferenceGraph,
+    _TEST_FILENAME_RE,
+    _is_test_file,
+    build_graph,
+)
 from deadcode.indexer import build_index
 from deadcode.models import (
     AnalysisResult,
     Candidate,
     EvidenceItem,
     FileIndex,
+    Location,
     RepoIndex,
     SafetyClassification,
     SymbolDef,
@@ -137,6 +144,17 @@ _UNITTEST_BASE_NAMES: frozenset[str] = frozenset({
 _UNITTEST_LIFECYCLE_METHODS: frozenset[str] = frozenset({
     "setUp", "tearDown",
     "setUpClass", "tearDownClass",
+})
+
+# Framework and root scripts that must never be classified PROVABLE.
+_FRAMEWORK_FILE_NAMES: frozenset[str] = frozenset({
+    "setup.py",
+    "manage.py",
+    "wsgi.py",
+    "asgi.py",
+    "noxfile.py",
+    "tasks.py",
+    "fabfile.py",
 })
 
 
@@ -217,6 +235,83 @@ def _parse_entrypoint_ref(target: str) -> str | None:
     if not module or not attr:
         return None
     return f"{module}.{attr}"
+
+
+def _extract_entrypoint_modules(repo_root: str) -> set[str]:
+    """
+    Extract module names referenced in ``pyproject.toml`` entry points.
+
+    Handles ``[project.scripts]``, ``[project.gui-scripts]``, and
+    ``[project.entry-points.*]`` sections per PEP 621.
+
+    Returns an empty set if ``pyproject.toml`` is not found, unreadable, or
+    contains no entry points.  Never raises.
+    """
+    modules: set[str] = set()
+    pyproject = Path(repo_root) / "pyproject.toml"
+    if not pyproject.exists():
+        return modules
+    try:
+        import tomllib
+
+        with open(pyproject, "rb") as f:
+            data = tomllib.load(f)
+    except Exception:  # noqa: BLE001
+        return modules
+
+    project = data.get("project", {})
+    if not isinstance(project, dict):
+        return modules
+
+    def _add_from_dict(d: dict[str, Any]) -> None:
+        for _name, target in d.items():
+            if isinstance(target, str):
+                target_str = target.strip()
+                if ":" in target_str:
+                    mod = target_str.partition(":")[0].strip()
+                    if mod:
+                        modules.add(mod)
+                elif target_str:
+                    modules.add(target_str)
+
+    for section in ("scripts", "gui-scripts"):
+        entries = project.get(section, {})
+        if isinstance(entries, dict):
+            _add_from_dict(entries)
+
+    entry_points = project.get("entry-points", {})
+    if isinstance(entry_points, dict):
+        for _group, entries in entry_points.items():
+            if isinstance(entries, dict):
+                _add_from_dict(entries)
+
+    return modules
+
+
+def _is_namespace_package_file(file_path: Path, repo_root: Path) -> bool:
+    """
+    Check if a file belongs to a PEP 420 namespace package (directory structure
+    lacking __init__.py).
+    """
+    try:
+        rel = file_path.resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        return False
+    parts = rel.parts
+    if len(parts) <= 1:
+        return False
+    if parts[0] == "src":
+        parts = parts[1:]
+        if len(parts) <= 1:
+            return False
+
+    current = file_path.parent.resolve()
+    root = repo_root.resolve()
+    while current != root and current != (root / "src"):
+        if not (current / "__init__.py").exists():
+            return True
+        current = current.parent
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +419,11 @@ def _classify_all(index: RepoIndex, graph: ReferenceGraph) -> list[Candidate]:
             )
         )
 
+    # Classify files/modules
+    entrypoint_modules = _extract_entrypoint_modules(index.root)
+    file_candidates = _classify_files(index, graph, entrypoint_modules)
+    candidates.extend(file_candidates)
+
     # Stable sort: PROVABLE first, then REVIEW, then ACTIVE; within each
     # group sort by file then line number.
     _order = {
@@ -339,6 +439,288 @@ def _classify_all(index: RepoIndex, graph: ReferenceGraph) -> list[Candidate]:
         )
     )
     return candidates
+
+
+def _classify_files(
+    index: RepoIndex,
+    graph: ReferenceGraph,
+    entrypoint_modules: set[str],
+) -> list[Candidate]:
+    """
+    Classify Python files/modules conservatively into PROVABLE, REVIEW, or ACTIVE.
+    """
+    module_to_file: dict[str, FileIndex] = {f.module_name: f for f in index.files}
+    repo_has_unresolved_dynamic_import = any(
+        f.has_unresolved_dynamic_import for f in index.files
+    )
+
+    all_dynamic_targets: set[str] = set()
+    for f in index.files:
+        all_dynamic_targets.update(f.dynamic_import_targets)
+
+    # Pre-collect exported names from __init__.py files
+    package_exports: dict[str, set[str]] = {}
+    for f in index.files:
+        if Path(f.path).name == "__init__.py" and f.all_names is not None:
+            package_exports[f.module_name] = set(f.all_names)
+
+    file_candidates: list[Candidate] = []
+
+    for fi in index.files:
+        file_path = Path(fi.path)
+        file_name = file_path.name
+        stem = file_path.stem
+        module_name = fi.module_name
+        is_private = stem.startswith("_")
+
+        defn = SymbolDef(
+            name=stem,
+            qualified_name=module_name,
+            kind=SymbolKind.MODULE,
+            location=Location(file=fi.path, line=1),
+            is_private=is_private,
+        )
+
+        incoming = graph.get_incoming_module_dependencies(module_name)
+
+        # Distinguish test vs prod incoming dependencies
+        prod_incoming: set[str] = set()
+        test_incoming: set[str] = set()
+        for c_mod in incoming:
+            c_fi = module_to_file.get(c_mod)
+            if c_fi is not None:
+                if _is_test_file(c_fi.path):
+                    test_incoming.add(c_mod)
+                else:
+                    prod_incoming.add(c_mod)
+            else:
+                if (
+                    _is_test_file(c_mod)
+                    or c_mod.startswith("tests.")
+                    or c_mod.startswith("test.")
+                    or c_mod == "conftest"
+                ):
+                    test_incoming.add(c_mod)
+                else:
+                    prod_incoming.add(c_mod)
+
+        # Safety reasons collection
+        review_reasons: list[EvidenceItem] = []
+
+        # 1. Parse errors
+        if fi.parse_error is not None:
+            review_reasons.append(
+                EvidenceItem(
+                    reason="file_parse_error",
+                    detail=f"File could not be parsed: {fi.parse_error}",
+                )
+            )
+
+        # 2. Test infrastructure
+        if file_name == "conftest.py":
+            review_reasons.append(
+                EvidenceItem(
+                    reason="conftest_discovery",
+                    detail="pytest conftest file discovered automatically",
+                )
+            )
+        elif any(
+            any(b in _UNITTEST_BASE_NAMES for b in d.base_classes)
+            for d in fi.definitions
+            if d.kind == SymbolKind.CLASS
+        ):
+            review_reasons.append(
+                EvidenceItem(
+                    reason="unittest_discovery",
+                    detail="File defines unittest TestCase discovered by test runner",
+                )
+            )
+        elif _is_test_file(fi.path) or bool(_TEST_FILENAME_RE.match(file_name)):
+            review_reasons.append(
+                EvidenceItem(
+                    reason="test_infrastructure",
+                    detail=f"Test file or test directory infrastructure: {file_name}",
+                )
+            )
+
+        # 3. Package initialization / entrypoints
+        if file_name == "__init__.py":
+            review_reasons.append(
+                EvidenceItem(
+                    reason="package_initialization",
+                    detail="Package initializer file (__init__.py)",
+                )
+            )
+        elif file_name == "__main__.py":
+            review_reasons.append(
+                EvidenceItem(
+                    reason="package_main_entrypoint",
+                    detail="Package executable entrypoint (__main__.py)",
+                )
+            )
+
+        # 4. Script entrypoints (main block or shebang)
+        if fi.has_main_block or fi.has_shebang:
+            detail_parts = []
+            if fi.has_main_block:
+                detail_parts.append('contains `if __name__ == "__main__":` block')
+            if fi.has_shebang:
+                detail_parts.append("contains shebang line")
+            review_reasons.append(
+                EvidenceItem(
+                    reason="script_entrypoint",
+                    detail=f"Executable script: {', '.join(detail_parts)}",
+                )
+            )
+
+        # 5. Framework conventions
+        if file_name in _FRAMEWORK_FILE_NAMES:
+            review_reasons.append(
+                EvidenceItem(
+                    reason="framework_convention",
+                    detail=f"Standard framework/tooling file: {file_name}",
+                )
+            )
+
+        # 6. Config entrypoints (pyproject.toml)
+        if (
+            module_name in entrypoint_modules
+            or stem in entrypoint_modules
+            or any(
+                m == module_name or m.startswith(f"{module_name}.")
+                for m in entrypoint_modules
+            )
+        ):
+            review_reasons.append(
+                EvidenceItem(
+                    reason="config_entrypoint",
+                    detail=f"Module referenced in pyproject.toml entrypoints: {module_name}",
+                )
+            )
+
+        # 7. Literal dynamic import target
+        if module_name in all_dynamic_targets or stem in all_dynamic_targets:
+            review_reasons.append(
+                EvidenceItem(
+                    reason="dynamic_import",
+                    detail=f"Module targeted by dynamic import (importlib / __import__): {module_name}",
+                )
+            )
+
+        # 8. Unresolved dynamic import in repo
+        if repo_has_unresolved_dynamic_import or fi.has_unresolved_dynamic_import:
+            review_reasons.append(
+                EvidenceItem(
+                    reason="unresolved_dynamic_import",
+                    detail="Repository contains unresolved dynamic module loading",
+                )
+            )
+
+        # 9. Namespace package
+        if _is_namespace_package_file(file_path, Path(index.root)):
+            review_reasons.append(
+                EvidenceItem(
+                    reason="namespace_package",
+                    detail="File belongs to a PEP 420 namespace package (missing __init__.py)",
+                )
+            )
+
+        # 10. Public API module (non-private stem)
+        if not is_private:
+            review_reasons.append(
+                EvidenceItem(
+                    reason="public_api_module",
+                    detail=f"Public module {file_name} without leading underscore may be part of public API",
+                )
+            )
+
+        # 11. __all__ export in parent package
+        parent_module = module_name.rsplit(".", 1)[0] if "." in module_name else ""
+        if parent_module and parent_module in package_exports:
+            if stem in package_exports[parent_module]:
+                review_reasons.append(
+                    EvidenceItem(
+                        reason="exported_in_all",
+                        detail=f"Module name '{stem}' listed in parent package __all__",
+                    )
+                )
+
+        # Classification decision based on priority
+        if fi.parse_error is not None:
+            classification = SafetyClassification.REVIEW
+            evidence = list(review_reasons)
+            uncertainty_reasons = [e.reason for e in review_reasons]
+        elif prod_incoming and not _is_test_file(fi.path) and file_name != "conftest.py":
+            classification = SafetyClassification.ACTIVE
+            evidence = [
+                EvidenceItem(
+                    reason="referenced",
+                    detail=f"{len(incoming)} incoming repository module dependency(ies): {', '.join(sorted(incoming))}",
+                )
+            ]
+            uncertainty_reasons = []
+        elif test_incoming and not prod_incoming and not _is_test_file(fi.path) and file_name != "conftest.py":
+            classification = SafetyClassification.REVIEW
+            test_ev = EvidenceItem(
+                reason="only_test_references",
+                detail=f"Module is imported only by test file(s): {', '.join(sorted(test_incoming))}",
+            )
+            evidence = [test_ev] + review_reasons
+            uncertainty_reasons = [test_ev.reason] + [e.reason for e in review_reasons]
+        elif review_reasons:
+            classification = SafetyClassification.REVIEW
+            prefix_ev = []
+            if incoming:
+                prefix_ev.append(
+                    EvidenceItem(
+                        reason="referenced",
+                        detail=f"{len(incoming)} incoming repository module dependency(ies): {', '.join(sorted(incoming))}",
+                    )
+                )
+            else:
+                prefix_ev.append(
+                    EvidenceItem(
+                        reason="no_incoming_dependencies",
+                        detail="No incoming repository imports",
+                    )
+                )
+            evidence = prefix_ev + review_reasons
+            uncertainty_reasons = [e.reason for e in review_reasons]
+        else:
+            classification = SafetyClassification.PROVABLE
+            evidence = [
+                EvidenceItem(reason="no_incoming_dependencies", detail="No incoming repository imports"),
+                EvidenceItem(reason="not_package_initializer", detail="Not a package initializer"),
+                EvidenceItem(reason="not_entrypoint", detail="Not an entrypoint"),
+                EvidenceItem(reason="not_test_infrastructure", detail="Not test infrastructure"),
+                EvidenceItem(reason="not_script_entrypoint", detail="No script entrypoint"),
+                EvidenceItem(reason="no_dynamic_loading", detail="No unresolved dynamic loading"),
+                EvidenceItem(reason="internal_module", detail="Internal/private module"),
+                EvidenceItem(reason="provable_unused", detail="Module has no detected incoming imports and passes all safety checks"),
+            ]
+            uncertainty_reasons = []
+
+        ref_locations = [
+            {"file": module_to_file[m].path, "line": 1, "context": "import"}
+            for m in sorted(incoming)
+            if m in module_to_file
+        ]
+
+        file_candidates.append(
+            Candidate(
+                symbol=defn,
+                classification=classification,
+                evidence=evidence,
+                ref_count=len(incoming),
+                ref_locations=ref_locations,
+                test_ref_count=len(test_incoming),
+                import_relationships=sorted(incoming),
+                is_exported=None,
+                uncertainty_reasons=uncertainty_reasons,
+            )
+        )
+
+    return file_candidates
 
 
 def _should_skip(defn: SymbolDef, file_index: FileIndex | None) -> bool:

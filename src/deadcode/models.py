@@ -25,6 +25,7 @@ class SymbolKind(str, enum.Enum):
     CLASS = "class"
     VARIABLE = "variable"
     IMPORT = "import"  # top-level import statement treated as a symbol
+    MODULE = "module"
 
 
 class SafetyClassification(str, enum.Enum):
@@ -200,6 +201,10 @@ class FileIndex:
     references: list[SymbolRef] = field(default_factory=list)
     imported_modules: set[str] = field(default_factory=set)
     has_wildcard_import: bool = False
+    has_main_block: bool = False
+    has_shebang: bool = False
+    has_unresolved_dynamic_import: bool = False
+    dynamic_import_targets: set[str] = field(default_factory=set)
     all_names: list[str] | None = None          # contents of __all__, or None
     parse_error: str | None = None              # error message if AST parse failed
 
