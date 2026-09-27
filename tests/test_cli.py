@@ -117,6 +117,25 @@ class TestHelp:
         result = runner.invoke(app, ["prove", "--help"])
         assert result.exit_code == 0
 
+    def test_bare_deadcode_shows_branded_splash(self):
+        result = runner.invoke(app, [])
+        assert result.exit_code == 0
+        assert "DELETE WITH EVIDENCE." in result.output
+        assert "Find unused code." in result.output
+        assert "Prove it's safe." in result.output
+        assert "Remove it confidently." in result.output
+        assert "scan" in result.output
+        assert "show" in result.output
+        assert "prove" in result.output
+        assert "apply" in result.output
+        assert "deadcode scan" in result.output
+
+    def test_bare_deadcode_narrow_terminal(self):
+        result = runner.invoke(app, [], env={"COLUMNS": "60"})
+        assert result.exit_code == 0
+        assert "DELETE WITH EVIDENCE." in result.output
+        assert "Find unused code." in result.output
+
 
 # ===========================================================================
 # 2. deadcode scan

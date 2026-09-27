@@ -49,7 +49,7 @@ from deadcode.state import (
 app = typer.Typer(
     name="deadcode",
     help="Find and safely remove unused Python code — with proof.",
-    no_args_is_help=True,
+    no_args_is_help=False,
     add_completion=False,
 )
 
@@ -677,7 +677,60 @@ def apply(
 
 # ---------------------------------------------------------------------------
 # Version / main entry point
-# ---------------------------------------------------------------------------
+BRAND_CORAL = "#FF8066"
+
+
+def _print_splash(out_console: Console | None = None) -> None:
+    """Display the DeadCode branded splash screen."""
+    c = out_console or console
+
+    icon = [
+        " ▄▀▀    ▄███▄    ▀▀▄",
+        "(      ██ █ ██      )",
+        " ▀▄▄    █ █ █    ▄▄▀",
+    ]
+    wordmark = [
+        "█▀▀▄  █▀▀▀  ▄▀▀▄  █▀▀▄   ▄▀▀▀  ▄▀▀▄  █▀▀▄  █▀▀▀",
+        "█  █  ███   █▄▄█  █  █   █     █  █  █  █  ███ ",
+        "▀▀▀   ▀▀▀▀  ▀  ▀  ▀▀▀    ▀▄▄▄  ▀▄▄▀  ▀▀▀   ▀▀▀▀",
+    ]
+
+    c.print()
+    if c.width >= 74:
+        banner = [f"{i}   {w}" for i, w in zip(icon, wordmark)]
+        for line in banner:
+            c.print(f"[bold {BRAND_CORAL}]{line}[/]")
+        c.print()
+        c.print(f"                        [bold {BRAND_CORAL}]DELETE WITH EVIDENCE.[/]")
+    else:
+        for i in icon:
+            c.print(f"[bold {BRAND_CORAL}]              {i.strip()}[/]")
+        c.print()
+        for w in wordmark:
+            c.print(f"[bold {BRAND_CORAL}]  {w}[/]")
+        c.print()
+        c.print(f"[bold {BRAND_CORAL}]               DELETE WITH EVIDENCE.[/]")
+
+    c.print()
+    c.print("  [bright_white]Find unused code.[/]")
+    c.print("  [bright_white]Prove it's safe.[/]")
+    c.print("  [bright_white]Remove it confidently.[/]")
+    c.print()
+    sep_len = min(58, max(40, c.width - 4))
+    sep = "  " + "─" * sep_len
+    c.print(f"[dim]{sep}[/]")
+    c.print()
+    c.print(f"  [bold {BRAND_CORAL}]scan[/]       [bright_white]Find potentially unused code[/]")
+    c.print(f"  [bold {BRAND_CORAL}]show[/]       [bright_white]Inspect candidate evidence[/]")
+    c.print(f"  [bold {BRAND_CORAL}]prove[/]      [bright_white]Prove removal in an isolated worktree[/]")
+    c.print(f"  [bold {BRAND_CORAL}]apply[/]      [bright_white]Apply a proven removal[/]")
+    c.print()
+    c.print(f"[dim]{sep}[/]")
+    c.print()
+    c.print("  [bright_white]DeadCode[/] [dim]•[/] [dim]Deterministic dead-code analysis[/]")
+    c.print()
+    c.print(f"  Run [bold {BRAND_CORAL}]`deadcode scan`[/] to get started.")
+    c.print()
 
 
 @app.callback(invoke_without_command=True)
@@ -693,4 +746,5 @@ def main(
         console.print("deadcode 0.1.0")
         raise typer.Exit()
     if ctx.invoked_subcommand is None:
-        console.print(ctx.get_help())
+        _print_splash(console)
+        raise typer.Exit()
